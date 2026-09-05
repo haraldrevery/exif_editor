@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Revery Exif",
+  "version": "0.1.0",
+  "identifier": "com.haraldrevery.exif",
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      },
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: asset: http://asset.localhost https://asset.localhost; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Revery Exif",
+        "url": "index.html",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 860,
+        "minHeight": 560,
+        "resizable": true,
+        "dragDropEnabled": true
+      }
+    ]
+  },
+  "build": {
+    "frontendDist": "../www",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "resources": {}
+  }
+}

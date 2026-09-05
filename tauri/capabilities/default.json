@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "description": "Capability for Revery Exif's main window. Deliberately minimal: the app's own commands do all file access through the library-root guard, so no broad filesystem plugin permission is granted.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open"
+  ]
+}

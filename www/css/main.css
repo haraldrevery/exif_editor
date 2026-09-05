@@ -1,0 +1,1764 @@
+@font-face {
+  font-family: "HaraldText";
+  src: url("../fonts/HaraldReveryTextFont.woff2") format("woff2"),
+       url("../fonts/HaraldReveryTextFont.woff") format("woff");
+  font-weight: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: "HaraldMono";
+  src: url("../fonts/HaraldReveryMonoFont.woff2") format("woff2"),
+       url("../fonts/HaraldReveryMonoFont.woff") format("woff");
+  font-weight: normal;
+  font-display: block;
+}
+
+/* Revery Exif — application styles.
+ *
+ * Dark by default: this is a photo tool, and a neutral dark shell keeps the
+ * eye on the images rather than on the chrome. Light theme follows the system
+ * for people who work in bright rooms.
+ *
+ * Everything is driven by the custom properties below, so theming is one
+ * block to change rather than a hunt through rules.
+ */
+
+:root {
+  /* Neutrals — deliberately slightly warm, so photos don't look jaundiced
+     against a cold blue-grey surround. */
+  --bg: #16181c;
+  --surface: #1d2025;
+  --surface-raised: #24282e;
+  --surface-hover: #2a2f36;
+  --border: #32373f;
+  --border-strong: #414852;
+
+  --text: #e8e6e1;
+  --text-dim: #9aa1aa;
+  --text-faint: #6b727b;
+
+  /* Amber reads as "selected" without the clinical feel of system blue, and
+     sits comfortably beside photographic colour. */
+  --accent: #d9a05b;
+  --accent-dim: #8a6537;
+  --accent-text: #1a1509;
+
+  --danger: #d97066;
+  --ok: #7fb069;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  --radius: 6px;
+  --radius-lg: 10px;
+
+  /* The brand faces, with a system stack behind them so a failed font load
+     degrades to something readable rather than to a fallback serif. */
+  --font: "HaraldText", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "HaraldMono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo,
+    Consolas, monospace;
+
+  /* HaraldText is a light, wide display face, and it renders small: measured
+     against DejaVu Sans at the same pixel size its x-height is only **62%**.
+     Matching that exactly would mean ~24px where a system face uses 15px,
+     which is absurd in a 380px panel — so these sizes split the difference.
+     They look large written down and correct on screen; do not "fix" them by
+     comparing the numbers to another app's. */
+  --font-size: 17px;
+  --line-height: 1.4;
+  --font-size-small: 14px;     /* field labels, hints, file names */
+  --font-size-tiny: 13px;      /* tag rows in the inspector */
+
+  --panel-width: 380px;
+  --divider-width: 1px;
+  --shadow: 0 2px 8px rgb(0 0 0 / 0.28);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f3f1;
+    --surface: #ffffff;
+    --surface-raised: #fbfaf9;
+    --surface-hover: #eeece9;
+    --border: #ddd9d4;
+    --border-strong: #c4bfb8;
+
+    --text: #1f2226;
+    --text-dim: #5f666e;
+    --text-faint: #8b9098;
+
+    --accent: #a86b21;
+    --accent-dim: #d9b98a;
+    --accent-text: #ffffff;
+
+    --danger: #b4413a;
+    --ok: #4f7a3a;
+
+    --shadow: 0 2px 8px rgb(0 0 0 / 0.10);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--font-size);
+  line-height: var(--line-height);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  /* A metadata editor is not a document — text selection on chrome elements
+     only produces accidental highlight smears while marquee-selecting. */
+  user-select: none;
+}
+
+/* ── Layout ─────────────────────────────────────────────────────────────── */
+
+#app {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  grid-template-columns: 1fr var(--divider-width) var(--panel-width);
+  grid-template-areas:
+    "toolbar toolbar  toolbar"
+    "grid    divider  panel"
+    "status  status   status";
+  height: 100vh;
+}
+
+/* ── Preview ──────────────────────────────────────────────────────────────
+   Shares the grid's cell. Entering preview mode hides the grid rather than
+   covering it, so the editor panel stays live and there is no focus trap to
+   reconcile with the app's five dialogs. */
+
+#preview {
+  grid-area: grid;
+  display: grid;
+  /* Stage takes what is left; the bar and the strip are their own height. */
+  grid-template-rows: 1fr auto auto;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg);
+}
+
+#preview[hidden] {
+  display: none;
+}
+
+#preview-stage {
+  position: relative;
+  overflow: hidden;
+  min-height: 0;
+  /* The photo is dragged, not the page. Without this a drag that starts on the
+     image is claimed as a native image drag before the pointer handlers see
+     it, and the pan never begins. */
+  touch-action: none;
+  cursor: grab;
+}
+
+#preview-stage.panning {
+  cursor: grabbing;
+}
+
+#preview-image {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform-origin: center;
+  /* Set from the bitmap's own dimensions in preview.js; the transform does
+     the fitting, so the element must not be constrained here. */
+  max-width: none;
+  max-height: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+#preview-image[hidden] {
+  display: none;
+}
+
+/* Honest about what is being shown: an extracted thumbnail is not the photo,
+   and presenting it as one makes the app look like it renders badly. */
+#preview-note {
+  position: absolute;
+  left: 50%;
+  bottom: var(--space-4);
+  transform: translateX(-50%);
+  max-width: min(560px, 90%);
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: var(--font-size-small);
+  text-align: center;
+}
+
+#preview-note[hidden] {
+  display: none;
+}
+
+#preview.loading #preview-stage::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--bg);
+  opacity: 0.6;
+}
+
+#preview-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+
+#preview-zoom {
+  min-width: 4ch;
+}
+
+/* ── Filmstrip ────────────────────────────────────────────────────────────
+   Virtualised the same way the grid is, one row instead of a plane. */
+
+#filmstrip {
+  overflow-x: auto;
+  overflow-y: hidden;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  padding: var(--space-2) var(--space-3);
+}
+
+#filmstrip-sizer {
+  position: relative;
+  height: 84px;
+}
+
+.strip-tile {
+  position: absolute;
+  top: 0;
+  width: 84px;
+  height: 84px;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg);
+  border: 2px solid transparent;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.strip-tile:hover {
+  border-color: var(--border-strong);
+}
+
+.strip-tile.current {
+  border-color: var(--accent);
+}
+
+.strip-tile img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+/* The strip's tiles are square, so a quarter turn needs no scaling to fit —
+   unlike the grid's, whose box is wider than it is tall. */
+.strip-tile img[data-orient="2"] {
+  transform: scaleX(-1);
+}
+
+.strip-tile img[data-orient="3"] {
+  transform: rotate(180deg);
+}
+
+.strip-tile img[data-orient="4"] {
+  transform: scaleY(-1);
+}
+
+.strip-tile img[data-orient="5"] {
+  transform: rotate(90deg) scaleX(-1);
+}
+
+.strip-tile img[data-orient="6"] {
+  transform: rotate(90deg);
+}
+
+.strip-tile img[data-orient="7"] {
+  transform: rotate(270deg) scaleX(-1);
+}
+
+.strip-tile img[data-orient="8"] {
+  transform: rotate(270deg);
+}
+
+/* ── Divider ──────────────────────────────────────────────────────────────
+   A hairline that reads as a boundary, with a hit area far wider than it —
+   see the ::before below. divider.js drives `--panel-width` as an inline
+   style on :root, which outranks both the declaration in :root and the
+   narrow-window override further down. */
+
+#divider {
+  grid-area: divider;
+  position: relative;
+  background: var(--border);
+  cursor: col-resize;
+  /* Above both neighbours, so the widened hit area is not covered by the
+     panel's own background. */
+  z-index: 2;
+  /* Without this a drag on a touch screen is claimed by the scroller before
+     the pointer handlers ever see it. */
+  touch-action: none;
+}
+
+#divider::before {
+  content: "";
+  position: absolute;
+  /* A 1px drag target is not a target. Grabbable well either side of the line
+     without the line itself getting any fatter. */
+  inset: 0 -4px;
+}
+
+#divider:hover,
+#divider.dragging,
+#divider:focus-visible {
+  background: var(--accent);
+}
+
+#divider:focus-visible {
+  outline: none;
+}
+
+/* ── Toolbar ────────────────────────────────────────────────────────────── */
+
+#toolbar {
+  grid-area: toolbar;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  /* The wordmark. HaraldText has one weight, so emphasis comes from spacing
+     and colour rather than a bold that would be synthesised. */
+  font-size: 17px;
+  letter-spacing: 0.06em;
+  margin-right: var(--space-2);
+  white-space: nowrap;
+}
+
+.brand span {
+  color: var(--accent);
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+button:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+input[type="search"],
+input[type="text"] {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  min-width: 0;
+  user-select: text;
+}
+
+input::placeholder {
+  color: var(--text-faint);
+}
+
+/* Two buttons that act on one thing, joined so they read as one control.
+   The shared edge is collapsed rather than doubled. */
+.button-group {
+  display: flex;
+}
+
+/* A class selector with `display` beats the UA stylesheet's `[hidden]` rule,
+   so the attribute silently stops working unless it is restated here — the
+   same trap as `#pending-bar` and `#preview`. Without this the thumbnail-size
+   buttons stay on screen in preview mode with `hidden` dutifully set. */
+.button-group[hidden] {
+  display: none;
+}
+
+.button-group button {
+  border-radius: 0;
+  /* The plus and minus are the whole label, so they need width the way a word
+     would not. Tabular figures keep the pair the same size. */
+  min-width: 34px;
+  font-variant-numeric: tabular-nums;
+}
+
+.button-group button:first-child {
+  border-radius: var(--radius) 0 0 var(--radius);
+}
+
+.button-group button:last-child {
+  border-radius: 0 var(--radius) var(--radius) 0;
+  border-left-width: 0;
+}
+
+.button-group button:focus-visible {
+  /* Above its neighbour, or the shared edge clips the focus ring. */
+  position: relative;
+  z-index: 1;
+}
+
+#filter {
+  flex: 1;
+  max-width: 320px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.count {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.count strong {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ── Grid ───────────────────────────────────────────────────────────────── */
+
+#grid-scroll {
+  grid-area: grid;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--space-4);
+  position: relative;
+}
+
+/* The virtualisation spacer: full scroll height, with only the visible rows
+   actually present in the DOM. */
+#grid-sizer {
+  position: relative;
+  width: 100%;
+}
+
+.tile {
+  position: absolute;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+  border: 2px solid transparent;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+}
+
+.tile:hover {
+  border-color: var(--border-strong);
+}
+
+.tile.selected {
+  border-color: var(--accent);
+}
+
+.tile.selected .tile-name {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.tile-image {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.tile-image img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+/* ── Orientation ──────────────────────────────────────────────────────────
+   Only extracted previews need this. Anything the webview decodes directly
+   reads orientation out of the file itself, and carries no `data-orient`.
+
+   **The suppression is scoped to `[data-orient]` and must stay that way.**
+   Applied to every image it silently un-rotates the ones the webview had
+   already got right — and only in Chromium, which honours the property, while
+   WebKitGTK ignores it and looks perfectly fine. That is a portrait photo
+   displayed sideways in the Electron build and correctly in the Tauri one,
+   from a stylesheet both of them share.
+
+   The quarter-turns are scaled as well as rotated. The tile's image box is
+   wider than it is tall — the name row takes height — so an image fitted to it
+   and then turned 90° no longer fits: the tile clips, and what gets clipped is
+   the middle of somebody's photograph. Scaling by the box's short/long ratio
+   guarantees the turned image lands inside it whatever its aspect, at the cost
+   of a few per cent of size.
+
+   That ratio is not a constant. The name row's height is set by its font and
+   does not scale with the tile, so the factor moves with tile size — 0.80 at
+   120px against 0.92 at 288px. grid.js measures a real tile once per size
+   change and writes the result; the value below is only the fallback for
+   before the first measurement. */
+/* Declared on the scroller, not on `.tile-image`, and this matters: grid.js
+   measures a real tile and writes the correct value as an inline style — on
+   the scroller. A declaration on `.tile-image` itself would set the property
+   *on* the element that consumes it, overriding the inherited one and pinning
+   every tile size to the 168px figure. This is the fallback for before the
+   first measurement; custom properties inherit, so tiles pick it up either
+   way. */
+#grid-scroll {
+  --quarter-turn-fit: 0.86;
+}
+
+/* An extracted preview is a bare JPEG blob whose rotation lives in the parent
+   file. Any orientation the blob happens to carry itself would be applied on
+   top of the transform below and turn it twice. */
+.tile-image img[data-orient],
+.strip-tile img[data-orient],
+#preview-image[data-orient] {
+  image-orientation: none;
+}
+
+.tile-image img[data-orient="2"] {
+  transform: scaleX(-1);
+}
+
+.tile-image img[data-orient="3"] {
+  transform: rotate(180deg);
+}
+
+.tile-image img[data-orient="4"] {
+  transform: scaleY(-1);
+}
+
+.tile-image img[data-orient="5"] {
+  transform: scale(var(--quarter-turn-fit)) rotate(90deg) scaleX(-1);
+}
+
+.tile-image img[data-orient="6"] {
+  transform: scale(var(--quarter-turn-fit)) rotate(90deg);
+}
+
+.tile-image img[data-orient="7"] {
+  transform: scale(var(--quarter-turn-fit)) rotate(270deg) scaleX(-1);
+}
+
+.tile-image img[data-orient="8"] {
+  transform: scale(var(--quarter-turn-fit)) rotate(270deg);
+}
+
+/* Shown while a preview is being extracted, and for the rare file that has
+   none at all. */
+.tile-placeholder {
+  color: var(--text-faint);
+  font-size: var(--font-size-small);
+  text-align: center;
+  padding: var(--space-2);
+  overflow-wrap: anywhere;
+}
+
+.tile-name {
+  padding: 3px var(--space-2);
+  font-size: var(--font-size-small);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: var(--surface-raised);
+  color: var(--text-dim);
+  border-top: 1px solid var(--border);
+}
+
+/* Corner badges: GPS presence is the one fact worth seeing without clicking. */
+.tile-badges {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+  display: flex;
+  gap: 3px;
+}
+
+.badge {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 9px;
+  font-weight: 700;
+  background: rgb(0 0 0 / 0.55);
+  color: var(--text);
+  backdrop-filter: blur(2px);
+}
+
+.badge.gps {
+  color: var(--accent);
+}
+
+/* A field holding typing that has not been applied. Subtle on purpose: the
+   pending bar already says how many changes are staged, and this only has to
+   answer "which of these boxes did I touch" when a draft is restored. */
+.input.drafted {
+  border-color: var(--accent-dim);
+}
+
+/* The per-file heading in the review dialog, shown only when the selection's
+   drafts disagree and the diff has to be split. */
+.diff-file {
+  margin: var(--space-4) 0 var(--space-2);
+  color: var(--text-dim);
+  font-size: var(--font-size-small);
+  font-family: var(--font-mono);
+}
+
+.diff-file:first-child {
+  margin-top: 0;
+}
+
+/* Unapplied edits. A filled dot rather than a glyph — at the smallest tile
+   size there is no room for a letter, and the icon set has nothing that means
+   "unsaved". The ring keeps it legible over a light photo as well as a dark
+   one, which a flat dot is not. */
+.badge.draft {
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px rgb(0 0 0 / 0.45);
+}
+
+/* An id selector with `display` beats the UA stylesheet's `[hidden]` rule, so
+   the attribute silently stops working unless it is restated here. */
+#empty-state[hidden] {
+  display: none;
+}
+
+#empty-state {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: var(--space-4);
+  color: var(--text-dim);
+  text-align: center;
+  padding: var(--space-6);
+}
+
+#empty-state h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+#empty-state p {
+  margin: 0;
+  max-width: 40ch;
+}
+
+/* ── Panel ──────────────────────────────────────────────────────────────── */
+
+#panel {
+  grid-area: panel;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+#tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.tab {
+  flex: 1;
+  padding: var(--space-3) var(--space-2);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--text-dim);
+  font-size: var(--font-size-small);
+}
+
+.tab:hover {
+  background: var(--surface-hover);
+}
+
+.tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab-panel {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-4);
+  min-height: 0;
+}
+
+.tab-panel[hidden] {
+  display: none;
+}
+
+.panel-hint {
+  color: var(--text-faint);
+  text-align: center;
+  padding: var(--space-6) var(--space-4);
+}
+
+/* Field rows in the curated panel. */
+.field {
+  margin-bottom: var(--space-4);
+}
+
+.field label {
+  display: block;
+  font-size: var(--font-size-small);
+  text-transform: uppercase;
+  /* Wider than usual: HaraldText's caps are narrow and close-set, and at this
+     size they run together without it. */
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+  margin-bottom: var(--space-1);
+}
+
+/* A value the user cannot change. Deliberately unlike an input — no box, no
+   border — so it never invites a click that will do nothing. Camera and lens
+   are shown for context; the app has no business rewriting what the camera
+   recorded. */
+.field .value {
+  padding: var(--space-2) 0;
+  min-height: 32px;
+  overflow-wrap: anywhere;
+  user-select: text;
+  color: var(--text-dim);
+  border-bottom: 1px dotted var(--border);
+}
+
+.field .value.empty {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* Lightroom's convention: a field whose value differs across the selection
+   reads as "mixed" rather than showing one file's value as if it were all. */
+.field .value.mixed {
+  color: var(--accent);
+  font-style: italic;
+}
+
+/* Editable variants of .value — same box, so a field does not jump when it
+   becomes editable. */
+/* An editable field reads as a control: a real box, full-strength text. */
+.value.input {
+  width: 100%;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  resize: vertical;
+  user-select: text;
+}
+
+.value.input.mixed::placeholder {
+  color: var(--accent);
+  font-style: italic;
+  opacity: 1;
+}
+
+/* A coordinate the app cannot read. Refusing beats guessing: a wrong guess
+   places the photo somewhere else and looks deliberate. */
+.value.input.invalid {
+  border-color: var(--danger);
+}
+
+.field-hint {
+  margin-top: var(--space-1);
+  font-size: var(--font-size-small);
+  color: var(--text-faint);
+}
+
+.gps-row {
+  display: flex;
+  gap: var(--space-2);
+}
+
+/* The pending-changes bar — the only route to touching a file. */
+#pending-bar {
+  display: flex;
+  align-items: center;
+  /* The panel drags down to 280px. Wrapping puts the message on its own row
+     rather than squeezing the three buttons into nothing. */
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border);
+  background: var(--surface-raised);
+  flex: none;
+}
+
+#pending-bar[hidden] {
+  display: none;
+}
+
+#pending-text {
+  /* Takes the whole row when it wraps, so the buttons stay side by side
+     underneath instead of one being orphaned. */
+  flex: 1 0 100%;
+  font-size: var(--font-size-small);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* Read-only note for states the panel cannot edit yet. */
+.readonly-note {
+  margin-top: var(--space-5);
+  padding: var(--space-3);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  color: var(--text-faint);
+  font-size: var(--font-size-small);
+}
+
+/* ── Inspector ──────────────────────────────────────────────────────────── */
+
+.inspector-bar {
+  display: flex;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+#inspector-filter {
+  flex: 1;
+  min-width: 0;
+}
+
+#add-tag {
+  flex: none;
+  white-space: nowrap;
+}
+
+.tag-group {
+  margin-bottom: var(--space-4);
+}
+
+.tag-group h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-small);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  padding: var(--space-1) 0;
+}
+
+.tag-row {
+  display: grid;
+  /* Third column for the row's actions. Fixed rather than auto so the value
+     column does not reflow as the buttons appear and disappear on hover. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) 44px;
+  gap: var(--space-3);
+  align-items: start;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--font-size-tiny);
+}
+
+.tag-row:last-child {
+  border-bottom: none;
+}
+
+.tag-name {
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.tag-value {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-tiny);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* ── Inspector row actions ──────────────────────────────────────────────── */
+
+.tag-actions {
+  display: flex;
+  gap: 2px;
+  justify-content: flex-end;
+}
+
+.tag-actions button {
+  padding: 0 3px;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  line-height: 1;
+  /* Revealed on hover or keyboard focus. A button on every one of several
+     hundred rows at full strength turns the inspector into noise. */
+  opacity: 0;
+  transition: opacity 90ms ease;
+}
+
+.tag-row:hover .tag-actions button,
+.tag-actions button:focus-visible {
+  opacity: 1;
+}
+
+.tag-actions button:hover:not(:disabled) {
+  color: var(--accent);
+  background: none;
+}
+
+.tag-actions button.clear:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+/* A locked tag keeps its row and says why, rather than vanishing: the All tab
+   is meant to be a complete view of the file. */
+.tag-locked {
+  justify-self: end;
+  color: var(--text-faint);
+  cursor: help;
+  user-select: none;
+}
+
+.tag-row.pending .tag-value {
+  color: var(--accent);
+}
+
+.tag-row.pending .tag-name::after {
+  content: ' •';
+  color: var(--accent);
+}
+
+.tag-row.removed .tag-value {
+  color: var(--danger);
+  text-decoration: line-through;
+}
+
+#tag-picker {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--text);
+  padding: var(--space-5);
+  max-width: min(620px, 92vw);
+  box-shadow: var(--shadow);
+}
+
+#tag-picker::backdrop {
+  background: rgb(0 0 0 / 0.5);
+}
+
+#tag-picker h2 {
+  margin: 0 0 var(--space-3);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+#tag-picker-filter {
+  width: min(560px, 86vw);
+  box-sizing: border-box;
+  margin-bottom: var(--space-3);
+}
+
+#tag-picker-list {
+  width: min(560px, 86vw);
+  /* Bounded, because the list runs to a couple of thousand entries. */
+  max-height: 46vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.tag-option {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: none;
+  padding: var(--space-2) var(--space-3);
+}
+
+.tag-option:hover:not(:disabled),
+.tag-option:focus-visible {
+  background: var(--surface);
+}
+
+.tag-option .name {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-small);
+  color: var(--text);
+}
+
+.tag-option .kind {
+  color: var(--text-faint);
+  font-size: var(--font-size-tiny);
+  margin-left: var(--space-2);
+}
+
+.tag-option .desc {
+  display: block;
+  color: var(--text-dim);
+  font-size: var(--font-size-tiny);
+  margin-top: 1px;
+}
+
+#tag-dialog {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--text);
+  padding: var(--space-5);
+  max-width: min(560px, 92vw);
+  box-shadow: var(--shadow);
+}
+
+#tag-dialog::backdrop {
+  background: rgb(0 0 0 / 0.5);
+}
+
+#tag-dialog h2 {
+  margin: 0 0 var(--space-2);
+  font-size: 15px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+#tag-dialog-hint {
+  margin: 0 0 var(--space-3);
+  color: var(--text-dim);
+  font-size: var(--font-size-small);
+}
+
+#tag-dialog-value {
+  width: min(500px, 86vw);
+  box-sizing: border-box;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-small);
+  resize: vertical;
+}
+
+/* ── Status bar ─────────────────────────────────────────────────────────── */
+
+#status {
+  grid-area: status;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: var(--font-size-small);
+  min-height: 28px;
+}
+
+#status .engine {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+
+#status.error {
+  color: var(--danger);
+}
+
+/* ── Review dialog ──────────────────────────────────────────────────────── */
+
+#review-dialog {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--text);
+  padding: var(--space-5);
+  max-width: min(620px, 90vw);
+  box-shadow: var(--shadow);
+}
+
+#review-dialog::backdrop {
+  background: rgb(0 0 0 / 0.5);
+}
+
+#review-dialog h2 {
+  margin: 0 0 var(--space-4);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.diff {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  /* A long batch must scroll inside the dialog rather than push the buttons
+     off the bottom of the screen. */
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.diff-row {
+  display: grid;
+  grid-template-columns: 110px 1fr auto 1fr;
+  gap: var(--space-3);
+  align-items: baseline;
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--font-size-small);
+}
+
+.diff-label {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.diff-from {
+  color: var(--text-faint);
+  text-decoration: line-through;
+  overflow-wrap: anywhere;
+}
+
+.diff-arrow {
+  color: var(--text-faint);
+}
+
+.diff-to {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.diff-to.removed {
+  color: var(--danger);
+  font-style: italic;
+}
+
+.diff-target {
+  margin: var(--space-4) 0 0;
+  color: var(--text-dim);
+  font-size: var(--font-size-small);
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-5);
+}
+
+/* ── Narrow windows ─────────────────────────────────────────────────────── */
+
+/* Overrides the *variable*, not the template.
+   Setting `grid-template-columns` here instead would win over the inline
+   `--panel-width` that divider.js writes, so a panel the user had dragged
+   would snap back to 300px the moment the window crossed this width — and
+   silently stay there, since the variable it was set from is still correct.
+   divider.js clamps against the window size itself, so a narrow window is
+   handled either way. */
+@media (max-width: 980px) {
+  :root {
+    --panel-width: 300px;
+  }
+}
+
+/* ── Geotagging ─────────────────────────────────────────────────────────── */
+
+.geo-section {
+  margin-bottom: var(--space-5);
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.geo-section:last-child {
+  border-bottom: none;
+}
+
+.geo-section h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-small);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+}
+
+.geo-section p {
+  margin: 0 0 var(--space-3);
+}
+
+.geo-section button {
+  margin-top: var(--space-2);
+}
+
+.geo-summary {
+  margin: var(--space-3) 0;
+  padding: var(--space-3);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  border-left: 3px solid var(--ok);
+  font-size: var(--font-size-small);
+}
+
+/* Nothing matched — almost always the time zone, so the message says so and
+   this styling makes it read as a problem to fix rather than a result. */
+.geo-summary.none {
+  border-left-color: var(--danger);
+  color: var(--danger);
+}
+
+.geo-unmatched {
+  margin-bottom: var(--space-3);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.geo-skip {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 2px 0;
+  font-size: var(--font-size-small);
+  border-bottom: 1px solid var(--border);
+}
+
+.geo-skip span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.geo-why {
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* ── Map ────────────────────────────────────────────────────────────────── */
+
+#map-paste {
+  width: 100%;
+  margin-bottom: var(--space-2);
+}
+
+#map-paste.invalid {
+  border-color: var(--danger);
+}
+
+#map {
+  height: 260px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  margin-bottom: var(--space-2);
+  /* Leaflet's own default is white, which flashes on every tab switch in a
+     dark shell. */
+  background: var(--bg);
+}
+
+/* Leaflet's controls are styled for a light raster basemap; these bring them
+   into the app's palette in both themes. */
+.leaflet-container {
+  font-family: var(--font);
+  background: var(--bg);
+  outline: none;
+}
+
+.leaflet-bar a,
+.leaflet-bar a:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+  border-bottom-color: var(--border);
+}
+
+.leaflet-bar a:hover {
+  background: var(--surface-hover);
+}
+
+.leaflet-tooltip {
+  background: var(--surface-raised);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  box-shadow: none;
+  font-size: var(--font-size-small);
+}
+
+.leaflet-tooltip::before {
+  border-top-color: var(--border-strong);
+}
+
+/* City labels: part of the basemap, not annotations — no box, no pointer
+   events, and quiet enough to read past. */
+.map-place-label {
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: var(--text-dim);
+  font-size: 9px;
+  line-height: 1;
+  padding: 0;
+  margin-left: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  width: auto !important;
+  height: auto !important;
+  /* A faint halo so a name stays readable where it crosses a coastline. */
+  text-shadow:
+    0 0 2px var(--bg),
+    0 0 3px var(--bg);
+}
+
+#map-apply {
+  margin-bottom: var(--space-4);
+}
+
+/* ── Tools ──────────────────────────────────────────────────────────────── */
+
+.shift-row {
+  display: flex;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.shift-field {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-small);
+  color: var(--text-faint);
+}
+
+.shift-field input {
+  /* Sized in em so it tracks the root: at 17px a 5em box left "minutes"
+     touching the panel edge. Two of these plus their labels have to fit a
+     380px column with a scrollbar in it. */
+  width: 4.2em;
+  /* Tabular figures so a two-digit value does not shift the label sideways. */
+  font-variant-numeric: tabular-nums;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  cursor: pointer;
+  font-size: var(--font-size-small);
+}
+
+.checkbox-row input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.strip-row {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+/* Destructive and irreversible-looking, so it is coloured as such — but it is
+   still undoable, like every other write. */
+button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+button.danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: var(--bg);
+}
+
+#confirm-dialog {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--text);
+  padding: var(--space-5);
+  max-width: min(460px, 90vw);
+  box-shadow: var(--shadow);
+}
+
+#confirm-dialog::backdrop {
+  background: rgb(0 0 0 / 0.5);
+}
+
+#confirm-dialog h2 {
+  margin: 0 0 var(--space-3);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+#confirm-dialog p {
+  margin: 0;
+  color: var(--text-dim);
+}
+
+/* ── Failure report ─────────────────────────────────────────────────────── */
+
+#status-details {
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-small);
+  color: var(--danger);
+  border-color: var(--danger);
+  flex: none;
+}
+
+#report-dialog {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--text);
+  padding: var(--space-5);
+  max-width: min(760px, 92vw);
+  box-shadow: var(--shadow);
+}
+
+#report-dialog::backdrop {
+  background: rgb(0 0 0 / 0.5);
+}
+
+#report-dialog h2 {
+  margin: 0 0 var(--space-3);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+#report-body {
+  width: min(700px, 86vw);
+  box-sizing: border-box;
+  resize: vertical;
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-small);
+  line-height: 1.5;
+  /* An ExifTool error is one long line; wrapping beats a horizontal scrollbar
+     in a box someone is trying to read and copy out of. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ── CSV export ─────────────────────────────────────────────────────────── */
+
+/* The export lives in its own container so its module can own a dialog without
+   tools.js rebuilding it. That makes the Tools tab's last *edit* section
+   `:last-child` of #tools, which drops the rule that used to separate them, so
+   the separator moves here. */
+#export .geo-section {
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-4);
+}
+
+#export-dialog {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--text);
+  padding: var(--space-5);
+  max-width: min(560px, 92vw);
+  box-shadow: var(--shadow);
+}
+
+#export-dialog::backdrop {
+  background: rgb(0 0 0 / 0.5);
+}
+
+#export-dialog h2 {
+  margin: 0 0 var(--space-4);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.export-heading {
+  margin: var(--space-4) 0 var(--space-2);
+  font-size: var(--font-size-small);
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.export-heading:first-of-type {
+  margin-top: 0;
+}
+
+/* Two columns: seventeen of these in one list is a dialog taller than a laptop
+   screen, and they are short enough to read side by side. Collapses to one
+   column rather than shrinking, because a truncated column name is useless. */
+#export-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  column-gap: var(--space-4);
+}
+
+/* The three columns every export writes. Marked rather than hidden, so the
+   list is the whole file rather than the optional part of it. */
+.column-always {
+  margin-left: auto;
+  font-size: var(--font-size-small);
+  color: var(--text-faint);
+  font-variant: small-caps;
+  letter-spacing: 0.04em;
+}
+
+#export-columns .checkbox-row input:disabled {
+  /* Disabled, but not greyed into looking unticked: these columns are on. */
+  opacity: 1;
+  cursor: default;
+}
+
+#export-protect-row {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+#export-protect-hint {
+  margin: 0 0 0 calc(13px + var(--space-2));
+  color: var(--text-faint);
+  font-size: var(--font-size-small);
+  line-height: 1.5;
+}
+
+#export-protect-hint code {
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+}
+
+/* Four tabs now; keep the labels from wrapping in a narrow panel. */
+#tabs .tab {
+  font-size: var(--font-size-small);
+  padding: var(--space-3) var(--space-1);
+  letter-spacing: 0.02em;
+}
+
+
+/* ── Icons ──────────────────────────────────────────────────────────────────
+   The Revery glyph set. Drawn as masks rather than <img>, so a single file
+   takes the colour of whatever it sits in — including the inverted colours of
+   a primary button — instead of needing a light and a dark copy of each. */
+
+.icon {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  flex: none;
+  vertical-align: -0.14em;
+  background-color: currentColor;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+
+button .icon {
+  margin-right: 0.45em;
+}
+
+.tab .icon {
+  margin-right: 0.3em;
+  opacity: 0.75;
+}
+
+.tab.active .icon {
+  opacity: 1;
+}
+
+.geo-section h3 .icon,
+.tag-group h3 .icon {
+  margin-right: 0.4em;
+}
+
+.icon-calendar {
+  -webkit-mask-image: url("../icons/calendar.svg");
+  mask-image: url("../icons/calendar.svg");
+}
+
+.icon-camera {
+  -webkit-mask-image: url("../icons/camera.svg");
+  mask-image: url("../icons/camera.svg");
+}
+
+.icon-compass-navigation {
+  -webkit-mask-image: url("../icons/compass_navigation.svg");
+  mask-image: url("../icons/compass_navigation.svg");
+}
+
+.icon-cross {
+  -webkit-mask-image: url("../icons/cross.svg");
+  mask-image: url("../icons/cross.svg");
+}
+
+.icon-delete {
+  -webkit-mask-image: url("../icons/delete.svg");
+  mask-image: url("../icons/delete.svg");
+}
+
+.icon-edit-file {
+  -webkit-mask-image: url("../icons/edit_file.svg");
+  mask-image: url("../icons/edit_file.svg");
+}
+
+.icon-export {
+  -webkit-mask-image: url("../icons/export.svg");
+  mask-image: url("../icons/export.svg");
+}
+
+.icon-folder {
+  -webkit-mask-image: url("../icons/folder.svg");
+  mask-image: url("../icons/folder.svg");
+}
+
+.icon-gear {
+  -webkit-mask-image: url("../icons/gear.svg");
+  mask-image: url("../icons/gear.svg");
+}
+
+.icon-haraldreverylogo {
+  -webkit-mask-image: url("../icons/haraldreverylogo.svg");
+  mask-image: url("../icons/haraldreverylogo.svg");
+}
+
+.icon-image {
+  -webkit-mask-image: url("../icons/image.svg");
+  mask-image: url("../icons/image.svg");
+}
+
+.icon-import {
+  -webkit-mask-image: url("../icons/import.svg");
+  mask-image: url("../icons/import.svg");
+}
+
+.icon-magnifier {
+  -webkit-mask-image: url("../icons/magnifier.svg");
+  mask-image: url("../icons/magnifier.svg");
+}
+
+.icon-open-folder {
+  -webkit-mask-image: url("../icons/open_folder.svg");
+  mask-image: url("../icons/open_folder.svg");
+}
+
+.icon-pin {
+  -webkit-mask-image: url("../icons/pin.svg");
+  mask-image: url("../icons/pin.svg");
+}
+
+.icon-refresh {
+  -webkit-mask-image: url("../icons/refresh.svg");
+  mask-image: url("../icons/refresh.svg");
+}
+
+.icon-save {
+  -webkit-mask-image: url("../icons/save.svg");
+  mask-image: url("../icons/save.svg");
+}
+
+.icon-settings-slider {
+  -webkit-mask-image: url("../icons/settings_slider.svg");
+  mask-image: url("../icons/settings_slider.svg");
+}
+
+.icon-table {
+  -webkit-mask-image: url("../icons/table.svg");
+  mask-image: url("../icons/table.svg");
+}
+
+.icon-undo {
+  -webkit-mask-image: url("../icons/undo.svg");
+  mask-image: url("../icons/undo.svg");
+}
+
+.icon-warning {
+  -webkit-mask-image: url("../icons/warning.svg");
+  mask-image: url("../icons/warning.svg");
+}

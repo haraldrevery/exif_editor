@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Tauri gets its CSP from tauri.conf.json; Electron has none unless the
+         page carries one. Declared here so both shells are covered by the same
+         policy: no remote anything, and no eval — except the WebAssembly
+         compilation the HEIC decoder needs, which Chromium gates on
+         'wasm-unsafe-eval' and WebKitGTK does not gate at all. Both
+         declarations must be changed together or the decoder fails silently
+         in exactly one shell. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: file: asset: http://asset.localhost https://asset.localhost; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost"
+    />
+    <title>Revery Exif</title>
+    <link rel="stylesheet" href="vendor/leaflet.css" />
+    <link rel="stylesheet" href="css/main.css" />
+    <!-- Must load before anything that calls it. -->
+    <script src="js/native_api.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <header id="toolbar">
+        <div class="brand">Revery <span>Exif</span></div>
+        <button id="open-folder" class="primary">
+          <span class="icon icon-open-folder" aria-hidden="true"></span>Open folder…
+        </button>
+        <button id="rescan" disabled>
+          <span class="icon icon-refresh" aria-hidden="true"></span>Refresh
+        </button>
+        <!-- The one way in and out of preview mode. Its label and icon are the
+             state: "Preview" in the grid, "Grid" while previewing. app.js owns
+             both, so nothing here is the initial value of anything but the
+             grid. -->
+        <button id="preview-toggle" disabled title="Preview the selected photo (Enter)">
+          <span class="icon icon-image" aria-hidden="true"></span
+          ><span id="preview-toggle-label">Preview</span>
+        </button>
+        <!-- Thumbnail size. Grouped so the pair reads as one control rather
+             than two unrelated buttons; the labels are the typographic minus
+             and plus, since the glyph set has neither. Hidden in preview mode,
+             where it would resize a grid nobody can see. -->
+        <div class="button-group" id="thumb-size" role="group" aria-label="Thumbnail size">
+          <button id="thumb-smaller" title="Smaller thumbnails" aria-label="Smaller thumbnails">
+            &#8722;
+          </button>
+          <button id="thumb-larger" title="Larger thumbnails" aria-label="Larger thumbnails">
+            &#43;
+          </button>
+        </div>
+        <!-- Appears only while there is a batch to undo. -->
+        <button id="undo" hidden>
+          <span class="icon icon-undo" aria-hidden="true"></span>Undo last change
+        </button>
+        <input
+          id="filter"
+          type="search"
+          placeholder="Filter by file name"
+          disabled
+          aria-label="Filter photos by file name"
+        />
+        <div class="spacer"></div>
+        <div class="count" id="count"></div>
+      </header>
+
+      <main id="grid-scroll" tabindex="0" aria-label="Photo grid">
+        <div id="grid-sizer"></div>
+        <div id="empty-state">
+          <h2>No folder open</h2>
+          <p>
+            Open a folder of photos to inspect their metadata. JPEG, HEIC, PNG,
+            TIFF and WebP are supported.
+          </p>
+          <button class="primary" data-action="open-folder">
+            <span class="icon icon-open-folder" aria-hidden="true"></span>Open folder…
+          </button>
+        </div>
+      </main>
+
+      <!-- Full preview. Shares the grid's cell: entering hides the grid rather
+           than covering it, so the editor panel stays usable and there is no
+           focus trap to fight with the dialogs. -->
+      <section id="preview" hidden aria-label="Photo preview">
+        <div id="preview-stage">
+          <img id="preview-image" alt="" draggable="false" />
+          <p id="preview-note" hidden></p>
+        </div>
+        <div id="preview-bar">
+          <!-- No way back to the grid here on purpose: the toolbar's toggle is
+               the single one, and Esc does the same. Two buttons for one mode
+               change is one more than the mode needs. -->
+          <button id="preview-fit" title="Fit to window (0)">Fit</button>
+          <button id="preview-actual" title="Actual size (1)">100%</button>
+          <span class="count" id="preview-zoom"></span>
+          <div class="spacer"></div>
+          <!-- Typographic arrows rather than icons: the glyph set has no
+               chevron, and inventing one would be the only drawn mark in the
+               app that did not come from the Revery assets. -->
+          <button id="preview-prev" title="Previous photo (←)" aria-label="Previous photo">
+            &#8592;
+          </button>
+          <button id="preview-next" title="Next photo (→)" aria-label="Next photo">
+            &#8594;
+          </button>
+        </div>
+        <div id="filmstrip" aria-label="Photos">
+          <div id="filmstrip-sizer"></div>
+        </div>
+      </section>
+
+      <!-- Drag to resize the panel. `separator` with a tabindex is the focusable
+           variant of the role, so the same adjustment is available from the
+           keyboard; the value attributes are maintained in divider.js. -->
+      <div
+        id="divider"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize the side panel"
+        tabindex="0"
+      ></div>
+
+      <aside id="panel">
+        <nav id="tabs" role="tablist">
+          <button class="tab active" data-tab="edit" role="tab">
+            <span class="icon icon-edit-file" aria-hidden="true"></span>Edit
+          </button>
+          <button class="tab" data-tab="map" role="tab">
+            <span class="icon icon-pin" aria-hidden="true"></span>Map
+          </button>
+          <button class="tab" data-tab="tools" role="tab">
+            <span class="icon icon-settings-slider" aria-hidden="true"></span>Tools
+          </button>
+          <button class="tab" data-tab="all" role="tab">
+            <span class="icon icon-table" aria-hidden="true"></span>All
+          </button>
+        </nav>
+
+        <section class="tab-panel" data-panel="edit" role="tabpanel">
+          <div class="panel-hint" id="edit-hint">Select a photo to see its metadata.</div>
+          <div id="edit-fields" hidden></div>
+        </section>
+
+        <!-- Nothing is written until Apply, and Apply always shows the diff
+             first. This bar is the only route to touching a file. -->
+        <div id="pending-bar" hidden>
+          <span id="pending-text"></span>
+          <button id="revert">Revert</button>
+          <button id="review">Review…</button>
+          <button id="apply" class="primary">Apply</button>
+        </div>
+
+        <section class="tab-panel" data-panel="map" role="tabpanel" hidden>
+          <input
+            id="map-paste"
+            type="text"
+            placeholder="Paste coordinates or a map link"
+            aria-label="Paste coordinates or a map link"
+          />
+          <div id="map"></div>
+          <p class="field-hint" id="map-hint">
+            Click the map to set a location for the selection.
+          </p>
+          <button id="map-apply" class="primary" hidden></button>
+          <div id="geotag"></div>
+        </section>
+
+        <section class="tab-panel" data-panel="tools" role="tabpanel" hidden>
+          <div id="tools"></div>
+          <!-- The one thing on this tab that writes nothing to a photo. Its own
+               container rather than a fourth section inside tools.js, for the
+               same reason #geotag is separate from the map: a module that owns
+               a dialog is not the same shape as one that stages an edit. -->
+          <div id="export"></div>
+        </section>
+
+        <section class="tab-panel" data-panel="all" role="tabpanel" hidden>
+          <div class="inspector-bar">
+            <input
+              id="inspector-filter"
+              type="search"
+              placeholder="Filter tags"
+              aria-label="Filter metadata tags"
+            />
+            <button id="add-tag" disabled>
+              <span class="icon icon-import" aria-hidden="true"></span>Add tag…
+            </button>
+          </div>
+          <div id="inspector">
+            <div class="panel-hint">Select a single photo to see every tag.</div>
+          </div>
+        </section>
+      </aside>
+
+      <footer id="status">
+        <span id="status-text">Ready</span>
+        <!-- Appears only when a batch reported a per-file failure. The reason
+             is what someone needs in order to act, and it is too long for a
+             one-line status bar. -->
+        <button id="status-details" hidden>Details</button>
+        <span class="engine" id="engine-version"></span>
+      </footer>
+    </div>
+
+    <dialog id="confirm-dialog">
+      <h2 id="confirm-title">Are you sure?</h2>
+      <p id="confirm-body"></p>
+      <div class="dialog-actions">
+        <button id="confirm-cancel">Cancel</button>
+        <button id="confirm-ok" class="danger">
+          <span class="icon icon-delete" aria-hidden="true"></span>Remove
+        </button>
+      </div>
+    </dialog>
+
+    <dialog id="review-dialog">
+      <h2>Review changes</h2>
+      <div id="review-body"></div>
+      <div class="dialog-actions">
+        <button id="review-cancel">Cancel</button>
+        <button id="review-confirm" class="primary">
+          <span class="icon icon-save" aria-hidden="true"></span>Write to file
+        </button>
+      </div>
+    </dialog>
+
+    <!-- A read-only textarea rather than a <pre>: it is selectable and
+         copyable with Ctrl+C in every webview, without needing clipboard
+         permissions the app does not otherwise ask for. -->
+    <!-- Editing one arbitrary tag. A dialog rather than an inline input
+         because the inspector rebuilds its whole tree on every filter
+         keystroke, which would throw away a half-typed value. -->
+    <!-- Choosing a tag the photo does not have yet. The list comes from the
+         bundled ExifTool at runtime, so it can never offer a tag this build
+         cannot write. -->
+    <dialog id="tag-picker">
+      <h2>Add a tag</h2>
+      <input
+        id="tag-picker-filter"
+        type="search"
+        placeholder="Search by name, group or description"
+        aria-label="Search writable tags"
+      />
+      <div id="tag-picker-list" role="listbox" aria-label="Writable tags"></div>
+      <div class="dialog-actions">
+        <button id="tag-picker-cancel">Cancel</button>
+      </div>
+    </dialog>
+
+    <dialog id="tag-dialog">
+      <h2 id="tag-dialog-title">Edit tag</h2>
+      <p id="tag-dialog-hint"></p>
+      <textarea id="tag-dialog-value" rows="3" spellcheck="false"></textarea>
+      <div class="dialog-actions">
+        <button id="tag-dialog-cancel">Cancel</button>
+        <button id="tag-dialog-ok" class="primary">Stage change</button>
+      </div>
+    </dialog>
+
+    <!-- Choosing what goes into a CSV. A dialog rather than more controls on
+         the Tools tab because the choice is made once per export and would
+         otherwise sit in the panel taking space between two things that do
+         write to files. -->
+    <dialog id="export-dialog">
+      <h2>Export a CSV</h2>
+      <h3 class="export-heading">Which photos</h3>
+      <div id="export-scope" role="radiogroup" aria-label="Which photos to export"></div>
+      <h3 class="export-heading">Columns</h3>
+      <div id="export-columns"></div>
+      <label class="checkbox-row" id="export-protect-row">
+        <input type="checkbox" id="export-protect" checked />
+        <span>Protect against spreadsheet formulas</span>
+      </label>
+      <p class="field-hint" id="export-protect-hint">
+        A caption starting with <code>=</code>, <code>+</code>, <code>-</code> or
+        <code>@</code> is run as a formula by Excel and LibreOffice rather than
+        shown. Ticked, those values get a leading apostrophe so they open as
+        text. Numbers, including negative coordinates, are never touched.
+      </p>
+      <div class="dialog-actions">
+        <button id="export-cancel">Cancel</button>
+        <button id="export-confirm" class="primary">
+          <span class="icon icon-save" aria-hidden="true"></span>Choose a file…
+        </button>
+      </div>
+    </dialog>
+
+    <dialog id="report-dialog">
+      <h2>What went wrong</h2>
+      <textarea id="report-body" readonly rows="12" spellcheck="false"></textarea>
+      <div class="dialog-actions">
+        <button id="report-close" class="primary">Close</button>
+      </div>
+    </dialog>
+
+    <script src="js/state.js"></script>
+    <!-- Pure, and required directly by test/csv.test.js. Must load before
+         export.js, which is only the window around it. -->
+    <script src="js/csv.js"></script>
+    <!-- Must load before grid.js: the grid builds its cache at construction. -->
+    <script src="js/preview_cache.js"></script>
+    <script src="js/grid.js"></script>
+    <script src="vendor/leaflet.js"></script>
+    <script src="js/map.js"></script>
+    <script src="js/prefs.js"></script>
+    <script src="js/divider.js"></script>
+    <!-- Optional: absent unless build_tools/fetch_heic_decoder.py has run.
+         preview.js degrades to the embedded thumbnail without it. -->
+    <script src="js/heic.js"></script>
+    <script src="js/preview.js"></script>
+    <script src="js/panel.js"></script>
+    <script src="js/geotag.js"></script>
+    <script src="js/tools.js"></script>
+    <script src="js/export.js"></script>
+    <script src="js/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "bundle": {
+    "resources": {
+      "../vendor/exiftool-unix": "vendor/exiftool-unix"
+    },
+    "targets": [
+      "deb",
+      "rpm",
+      "appimage"
+    ]
+  }
+}

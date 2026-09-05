@@ -1,0 +1,25 @@
+# Vendored ExifTool — ~56 MB across both platforms, restored reproducibly by
+# build_tools/fetch_exiftool.py against Phil Harvey's published checksums.
+vendor/exiftool-unix/
+vendor/exiftool-windows/
+
+node_modules/
+tauri/target/
+tauri/gen/
+dist-electron/
+
+# Fetched by build_tools/fetch_map_assets.py, checksum-pinned.
+www/vendor/
+
+# Test fixtures are generated but small (~28 KB) and are committed on purpose:
+# they are what the metadata-integrity assertions are written against, so they
+# must not drift silently between machines.
+!test/fixtures/
+
+# Undo snapshots live beside the photos being edited. A test run against
+# test/fixtures/ can leave one here.
+.revery_exif_undo/
+*.revery_exif.tmp
+
+*.log
+.DS_Store

@@ -1,0 +1,109 @@
+{
+  "name": "revery-exif",
+  "version": "0.1.0",
+  "description": "Revery Exif \u2014 image metadata and GPS editor",
+  "private": true,
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "homepage": "https://haraldrevery.com",
+  "author": {
+    "name": "Harald Revery",
+    "email": "contact@haraldrevery.com"
+  },
+  "scripts": {
+    "start:tauri": "tauri dev --config tauri/tauri.conf.json",
+    "build:tauri": "tauri build --config tauri/tauri.conf.json",
+    "test": "node --test \"test/**/*.test.js\"",
+    "test:rust": "cargo test --manifest-path tauri/Cargo.toml",
+    "vendor": "python3 build_tools/fetch_exiftool.py --all",
+    "vendor:heic": "python3 build_tools/fetch_heic_decoder.py",
+    "vendor:check": "python3 build_tools/fetch_exiftool.py --check && python3 build_tools/fetch_heic_decoder.py --check",
+    "start:electron": "electron .",
+    "build:electron": "electron-builder",
+    "build:core": "cargo build --manifest-path tauri/Cargo.toml --release --bin revery-exif-core",
+    "build:linux": "npm run build:core && electron-builder --linux deb rpm AppImage",
+    "build:windows": "electron-builder --win nsis msi portable",
+    "build:mac": "npm run build:core && electron-builder --mac dmg zip"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "electron": "^41.5.0",
+    "electron-builder": "^26.8.1"
+  },
+  "main": "electron/main.js",
+  "build": {
+    "appId": "com.haraldrevery.exif",
+    "productName": "Revery Exif",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "www/**/*",
+      "electron/**/*",
+      "!www/css/css_aesthetics/**"
+    ],
+    "extraResources": [
+      {
+        "from": "tauri/target/release/revery-exif-core",
+        "to": "core/revery-exif-core"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.photography",
+      "icon": "tauri/icons/icon.icns",
+      "extraResources": [
+        {
+          "from": "vendor/exiftool-unix",
+          "to": "vendor/exiftool-unix"
+        }
+      ],
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "msi",
+        "portable"
+      ],
+      "icon": "tauri/icons/icon.ico",
+      "extraResources": [
+        {
+          "from": "tauri/target/release/revery-exif-core.exe",
+          "to": "core/revery-exif-core.exe"
+        },
+        {
+          "from": "vendor/exiftool-windows",
+          "to": "vendor/exiftool-windows"
+        }
+      ]
+    },
+    "linux": {
+      "target": [
+        "deb",
+        "rpm",
+        "AppImage"
+      ],
+      "category": "Graphics",
+      "maintainer": "Harald Revery Mark Thirslund <contact@haraldrevery.com>",
+      "icon": "tauri/icons",
+      "synopsis": "Edit image metadata and GPS location",
+      "extraResources": [
+        {
+          "from": "vendor/exiftool-unix",
+          "to": "vendor/exiftool-unix"
+        }
+      ],
+      "executableName": "revery-exif",
+      "syncDesktopName": true
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
