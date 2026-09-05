@@ -191,15 +191,19 @@ function decodeThumbnailItem(api, wrapper, maxEdge) {
 
 async function handleMessage(event) {
   const { id, bytes, maxEdge, thumbnailOnly } = event.data || {};
-  let image = null;
+  let heif = null;
+  // The reader, not its context: `decode` can allocate a context and then fail,
+  // and holding the reader is the only way to reach that allocation afterwards.
+  let reader = null;
+  let images = [];
   try {
-    const heif = await ensureDecoder();
-    const decoder = new heif.HeifDecoder();
+    heif = await ensureDecoder();
+    reader = new heif.HeifDecoder();
     // A HEIC is a *container*: burst shots and live photos hold several
     // images. The first is the primary one, which is what a viewer shows.
-    const images = decoder.decode(new Uint8Array(bytes));
-    if (!images || !images.length) throw new Error('no image inside the file');
-    image = images[0];
+    images = reader.decode(new Uint8Array(bytes)) || [];
+    if (!images.length) throw new Error('no image inside the file');
+    const image = images[0];
 
     const width = image.get_width();
     const height = image.get_height();
@@ -257,12 +261,38 @@ async function handleMessage(event) {
   } finally {
     // Emscripten heap, not JavaScript heap: the garbage collector cannot see
     // it, so a decode per photo across a filmstrip would grow without bound.
-    if (image && typeof image.free === 'function') {
+    //
+    // Every handle, not just the primary: a burst shot or a live photo is
+    // several top-level images and `decode` returns a handle for each.
+    for (const handle of images) {
       try {
-        image.free();
+        if (handle && typeof handle.free === 'function') handle.free();
       } catch (_) {
         /* Older builds free with the decoder. */
       }
+    }
+
+    // **And the context, which nothing else frees.** `HeifDecoder.decode`
+    // releases only the context of a *previous* `decode` on the same reader,
+    // and this file builds a reader per message — so without this the parsed
+    // file (a copy of every byte of it) stays in the wasm heap for the life of
+    // the worker. Measured at ~1.8x the file size per decode against
+    // `test/fixtures/phone.heic`, which is gigabytes over a folder of phone
+    // photos and ends as an out-of-memory abort, reported to the user as the
+    // decoder having failed.
+    //
+    // After the handles, which point into it. A reader per message rather than
+    // one shared reader is deliberate: `handleMessage` awaits, so two requests
+    // can be in flight at once (`MAX_INFLIGHT_PREVIEWS` is 2), and sharing a
+    // reader would have the second `decode` free a context the first is still
+    // reading from.
+    if (heif && reader && reader.decoder) {
+      try {
+        heif.heif_context_free(reader.decoder);
+      } catch (_) {
+        /* Nothing left to do about it; the handles above are already gone. */
+      }
+      reader.decoder = null;
     }
   }
 }
@@ -272,8 +302,12 @@ async function handleMessage(event) {
 // are exactly the kind of thing that breaks silently on a decoder upgrade, and
 // a unit test is the only place that gets noticed. Registering the listener
 // would make the module unrequirable, so it is the branch, not the default.
+//
+// `handleMessage` and `ensureDecoder` are exported for the same reason: the
+// wasm heap it frees is invisible from JavaScript, so nothing but a test that
+// watches the allocator would notice the release going missing again.
 if (typeof module === 'object' && module.exports) {
-  module.exports = { decodeThumbnailItem, copyInterleaved };
+  module.exports = { decodeThumbnailItem, copyInterleaved, handleMessage, ensureDecoder };
 } else {
   self.addEventListener('message', handleMessage);
 }

@@ -27,6 +27,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const BUNDLE = path.join(__dirname, '../www/vendor/libheif/libheif-bundle.js');
+const WORKER = path.join(__dirname, '../www/js/heic_worker.js');
 const FIXTURE = path.join(__dirname, 'fixtures/phone.heic');
 
 const { decodeThumbnailItem, copyInterleaved } = require('../www/js/heic_worker.js');
@@ -34,12 +35,15 @@ const { decodeThumbnailItem, copyInterleaved } = require('../www/js/heic_worker.
 const haveDecoder = fs.existsSync(BUNDLE);
 
 /**
- * Loads the bundle into its own realm and returns the libheif module object.
+ * A worker-shaped realm.
  *
- * A vm context rather than a plain `require` because the bundle is written for
- * a worker: it assigns to `self` and expects to *be* the global scope.
+ * A vm context rather than a plain `require` because both the bundle and the
+ * worker are written for one: they assign to `self` and expect it to *be* the
+ * global scope. One realm for both, because embind's `std::string` binding
+ * does an `instanceof Uint8Array` check against the constructor it can see, and
+ * an array from another realm fails it.
  */
-async function loadDecoder() {
+function makeSandbox() {
   const sandbox = {
     console,
     TextDecoder,
@@ -58,12 +62,40 @@ async function loadDecoder() {
   sandbox.globalThis = sandbox;
   sandbox.module = { exports: {} };
   sandbox.exports = sandbox.module.exports;
-  vm.createContext(sandbox);
+  return vm.createContext(sandbox);
+}
+
+/** Loads the bundle into its own realm and returns the libheif module object. */
+async function loadDecoder() {
+  const sandbox = makeSandbox();
   vm.runInContext(fs.readFileSync(BUNDLE, 'utf8'), sandbox, { filename: BUNDLE });
 
   let api = sandbox.libheif;
   if (typeof api === 'function') api = await api();
   return { api, sandbox };
+}
+
+/**
+ * Loads `heic_worker.js` itself, wired to a real decoder, and captures what it
+ * posts back.
+ *
+ * The api comes from the worker's own `ensureDecoder` rather than from a second
+ * load of the bundle: an Emscripten factory called twice yields two independent
+ * wasm instances with two independent heaps, and a test that watched the wrong
+ * one would pass regardless.
+ */
+async function loadWorker() {
+  const sandbox = makeSandbox();
+  const posted = [];
+  sandbox.self.postMessage = (message) => posted.push(message);
+  sandbox.self.importScripts = () => {
+    vm.runInContext(fs.readFileSync(BUNDLE, 'utf8'), sandbox, { filename: BUNDLE });
+  };
+  vm.runInContext(fs.readFileSync(WORKER, 'utf8'), sandbox, { filename: WORKER });
+
+  const worker = sandbox.module.exports;
+  const api = await worker.ensureDecoder();
+  return { worker, api, sandbox, posted };
 }
 
 /**
@@ -135,8 +167,8 @@ test('the floor decides, and the boundary is inclusive', { skip: !haveDecoder },
   assert.equal(decodeThumbnailItem(api, image.handle, 288), null);
   // The boundary itself is good enough: >=, not >.
   assert.ok(decodeThumbnailItem(api, image.handle, 256));
-  // And the floor the grid actually passes — `SHARP_TILE_MIN` in grid.js, the
-  // tile size at which the 160x120 EXIF thumbnail stopped being adequate.
+  // And the floor the grid actually passes — `THUMBNAIL_ITEM_MIN_EDGE` in
+  // grid.js, the smallest item worth taking over the alternative.
   // Pinned because it is the number that decides whether real files take the
   // cheap path at all: raise it to the 512 the result is *stored* at and this
   // fixture, and the 256/320 px items cameras commonly write, all fall back to
@@ -163,6 +195,93 @@ test('declining is cheap enough to be the common answer', { skip: !haveDecoder }
   // returning null rather than falling back is what makes that true; the
   // worker's `thumbnailOnly` flag is what carries it out to the caller.
   assert.equal(decodeThumbnailItem(api, image.handle, 4096), null);
+});
+
+/* ── What the worker frees ───────────────────────────────────────────────── */
+
+/**
+ * A message shaped like the ones `heic.js` posts, in the worker's own realm.
+ *
+ * The bytes have to be re-read per call: `handleMessage` neuters the buffer by
+ * transferring it, exactly as a real `postMessage` would.
+ */
+function decodeRequest(sandbox, id, maxEdge, thumbnailOnly) {
+  return { data: { id, bytes: loadFixture(sandbox, FIXTURE).buffer, maxEdge, thumbnailOnly } };
+}
+
+/**
+ * Where the allocator would put the next block — a proxy for the high-water
+ * mark of the wasm heap.
+ *
+ * Freed immediately, so the probe itself does not move it: a leak shows up as
+ * this number climbing across otherwise identical decodes.
+ */
+function allocatorTop(api) {
+  const ptr = api._malloc(64);
+  api._free(ptr);
+  return ptr;
+}
+
+test('a decode releases everything it allocated', { skip: !haveDecoder }, async () => {
+  const { worker, api, sandbox, posted } = await loadWorker();
+
+  // One decode first, so any one-off allocation the decoder makes on its first
+  // use is behind us and the baseline is a steady state.
+  await worker.handleMessage(decodeRequest(sandbox, 0, 224, true));
+  const before = allocatorTop(api);
+
+  for (let i = 1; i <= 60; i += 1) {
+    // Both paths: the thumbnail item, and — every tenth — the full-resolution
+    // decode of the primary image, which allocates far more.
+    await worker.handleMessage(decodeRequest(sandbox, i, i % 10 === 0 ? 0 : 224, i % 10 !== 0));
+  }
+
+  assert.equal(posted.length, 61, 'every request should have been answered');
+  assert.ok(posted.every((message) => message.ok), 'no decode should have failed');
+
+  // The `heif_context` holds a copy of every byte of the file, and nothing but
+  // `handleMessage` will ever free it: `HeifDecoder.decode` releases only the
+  // context of a previous decode on the *same* reader, and there is a fresh
+  // reader per message. Left unreleased this grew by roughly 1.8x the file size
+  // per decode, which is gigabytes over a folder of phone photos and ends as an
+  // out-of-memory abort the user sees as "the decoder failed".
+  const after = allocatorTop(api);
+  assert.equal(
+    after,
+    before,
+    `the wasm heap grew by ${after - before} bytes over 60 decodes; something is not being freed`
+  );
+});
+
+test('the thumbnail path and the full decode both answer, and differ', { skip: !haveDecoder }, async () => {
+  const { worker, sandbox, posted } = await loadWorker();
+
+  await worker.handleMessage(decodeRequest(sandbox, 1, 224, true));
+  await worker.handleMessage(decodeRequest(sandbox, 2, 0, false));
+
+  const [thumb, full] = posted;
+  assert.ok(thumb.ok && thumb.fromThumbnail, 'the 224 px request should take the thumbnail item');
+  assert.deepEqual([thumb.width, thumb.height], [256, 192]);
+
+  assert.ok(full.ok, 'the unlimited request should decode the primary image');
+  assert.ok(!full.fromThumbnail);
+  assert.deepEqual([full.width, full.height], [640, 480]);
+});
+
+test('a thumbnail-only request that cannot be served says so', { skip: !haveDecoder }, async () => {
+  const { worker, sandbox, posted } = await loadWorker();
+
+  // 4096 px is past anything the fixture carries. With `thumbnailOnly` this is
+  // an answer; without it, it is a reason to decode the primary image. The grid
+  // depends on both halves — the first keeps a "no" cheap, the second is what
+  // stops its last resort decoding a full frame for a file that had a perfectly
+  // good 256 px item all along.
+  await worker.handleMessage(decodeRequest(sandbox, 1, 4096, true));
+  assert.equal(posted[0].ok, false);
+
+  await worker.handleMessage(decodeRequest(sandbox, 2, 4096, false));
+  assert.ok(posted[1].ok);
+  assert.deepEqual([posted[1].width, posted[1].height], [640, 480]);
 });
 
 test('copyInterleaved unpads rows when stride exceeds the row width', () => {

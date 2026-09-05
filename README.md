@@ -629,13 +629,22 @@ Two details that are not obvious:
   other produces a build that silently falls back to thumbnails in exactly one
   shell.
 
-The **grid** uses the decoder too, but only where extraction comes back empty —
-a HEIC out of a converter, whose sole thumbnail is another HEVC image item.
-Phone photos keep the free path: their EXIF thumbnail is a byte copy, and a
-folder of 500 must not start 500 software HEVC decodes to draw a wall of
-squares. The decoded tile is cached as a **data URI**, not a blob URL, so the
-preview cache's byte budget accounts for it and nothing is left to revoke when
-it is evicted.
+The **grid** uses the decoder too, but for the container's own `thmb` item
+rather than its primary image — the same thing a Linux file manager reads, and
+roughly a kilobyte of HEVC against a 12 MP frame. That item is typically 256x192
+or 320x240, so the two numbers involved are deliberately different: tiles are
+*stored* at 512 px (`THUMBNAIL_DECODE_EDGE`), but an item is worth taking from
+224 px up (`THUMBNAIL_ITEM_MIN_EDGE`). Collapsing them — asking for an item of
+at least 512 px, which almost no file carries — declines every real thumbnail
+and decodes the full frame instead. Nothing looks wrong; the folder is just
+slow. It is pinned in `test/heic_routing.test.js` for that reason.
+
+A full-resolution decode remains the grid's **last** resort, for a HEIC out of a
+converter that has neither an EXIF thumbnail nor a `thmb` item. A folder of 500
+must not start 500 software HEVC decodes to draw a wall of squares. The decoded
+tile is cached as a **data URI**, not a blob URL, so the preview cache's byte
+budget accounts for it and nothing is left to revoke when it is evicted — and
+`thumbcache.rs` keeps it across launches.
 
 The decoder is **optional and separately licensed**. libheif and its HEVC
 decoder are LGPL-3.0 against this project's Apache-2.0, and HEVC is
@@ -843,6 +852,16 @@ set, installer branding, and code signing.
   are pinned by `test/heic_thumbnail.test.js` against the real decoder, because
   the failure mode is silent: get it wrong and the app reports no thumbnail,
   falls back to a full-resolution decode, and still looks correct.
+
+- **Nothing but a test watches the wasm heap.** A decode allocates a
+  `heif_context` holding a copy of the whole file, and the bundle's
+  `HeifDecoder.decode` frees only the context of a *previous* decode on the same
+  reader — of which there is one per message. `heic_worker.js` releases it by
+  hand; if that ever goes missing again the leak is invisible from JavaScript,
+  survives every functional test, and surfaces only as an out-of-memory abort
+  partway through a large folder, reported to the user as the decoder having
+  failed. `test/heic_thumbnail.test.js` watches the allocator across 60 decodes
+  for exactly this.
 
 - **No *automated* test drives the UI**, but the round trip has been walked by
   hand with `build_tools/ui_probe.py`: click the map, Set this location,

@@ -10,6 +10,9 @@
  * no browser engine decodes — ExifTool extracts the embedded preview, which is
  * a byte copy rather than a decode and so is fast enough to do on demand.
  *
+ * HEIC has a third route ahead of both, and the numbers that govern it are the
+ * easiest thing here to get subtly wrong: see `THUMBNAIL_ITEM_MIN_EDGE`.
+ *
  * # Three things here are load-bearing and easy to undo by accident
  *
  * **A resolved preview is painted synchronously.** Once a path's URL is known,
@@ -79,15 +82,34 @@
    * Tile size at which the extracted EXIF thumbnail stops being good enough.
    *
    * That thumbnail is 160x120 — measured, not assumed; it is what every phone
-   * writes and what `test/fixtures/phone.heic` carries. Drawn into a 120 or
-   * 168 px tile it is fine. Drawn into a 224 or 288 px one, or into any tile on
-   * a 2x display, it is being upscaled several times over and looks it, while
-   * the file has a far better thumbnail sitting unused inside it.
+   * writes and what `test/fixtures/phone.heic` carries. At a 120 px tile it is
+   * being *downscaled* and is exactly right. From 168 px up — the default, and
+   * every size above it — its long edge is upscaled to fill the tile, while the
+   * file has a far better thumbnail sitting unused inside it.
    *
    * Below this the byte copy wins and nothing decodes; at or above it, HEIC
    * tiles try the container's own `thmb` item first.
+   *
+   * **Not the same number as `THUMBNAIL_ITEM_MIN_EDGE`,** though it used to be.
+   * This one is a question about the tile; that one is a question about the
+   * file. Sharing a constant between them meant this threshold could not be
+   * moved without also changing which thumbnail items are accepted and cached.
    */
-  const SHARP_TILE_MIN = 224;
+  const SHARP_TILE_MIN = DEFAULT_TILE_SIZE;
+
+  /**
+   * Smallest `thmb` item worth taking instead of the alternative.
+   *
+   * The bar is the image this replaces, not the tile it fills: the alternative
+   * is a 160x120 EXIF thumbnail, or — for converter output, which has no EXIF
+   * thumbnail at all — a full-resolution decode. Anything comfortably past
+   * 160x120 wins on both counts.
+   *
+   * Deliberately far below `THUMBNAIL_DECODE_EDGE`. Asking for the full 512
+   * would decline the 256 and 320 px items that are common, then fall back to
+   * the worse image anyway, having already paid for the whole-file read.
+   */
+  const THUMBNAIL_ITEM_MIN_EDGE = 224;
 
   /** Whether a name claims to be HEIC. Only decides what to try, never truth. */
   function isHeicName(name) {
@@ -338,13 +360,7 @@
       const url = await window.ExifHeic.decodeEmbeddedThumbnail(
         path,
         THUMBNAIL_DECODE_EDGE,
-        // The bar is the image this replaces, not the tile it fills. A 160x120
-        // EXIF thumbnail is what the alternative route returns, so any item
-        // that serves the tile size which made it insufficient is an
-        // improvement — and asking for the full 512 instead would decline the
-        // 256 and 320 px items that are common, then fall back to the 160x120
-        // anyway, having already paid for the read.
-        SHARP_TILE_MIN
+        THUMBNAIL_ITEM_MIN_EDGE
       );
       // A data URI, so the cache's byte budget accounts for it and nothing
       // needs revoking when it is evicted. See heic.js.
@@ -413,15 +429,28 @@
         // Last resort, and only for HEIC. Extraction found nothing, which for
         // this format means the file came out of a converter: its only
         // thumbnail is another HEVC image item, not a JPEG anyone can hand
-        // back. Decoding is expensive — hundreds of milliseconds of software
-        // HEVC against a byte copy — so it runs *here*, after both cheap routes
-        // have failed, rather than for every HEIC in the folder. A phone photo
-        // never reaches this line.
+        // back.
+        //
+        // This is the only route that may decode a full 12 MP frame — hundreds
+        // of milliseconds of software HEVC — so it runs *here*, after every
+        // cheap route has failed, rather than for every HEIC in the folder. A
+        // phone photo never reaches this line. It is not *only* a full decode,
+        // though: given a floor it takes the container's thumbnail item when
+        // there is one, which is what the file managers do and what the tile
+        // size gate above may have skipped.
         if (isHeicName(entry.name) && window.ExifHeic) {
           setNote(path, 'Decoding…');
           let url = null;
           try {
-            url = await window.ExifHeic.decodeToThumbnail(path, THUMBNAIL_DECODE_EDGE);
+            url = await window.ExifHeic.decodeToThumbnail(
+              path,
+              THUMBNAIL_DECODE_EDGE,
+              // The same floor the route above uses, and for the same reason.
+              // Leaving it out asks for a thumbnail item of at least 512 px,
+              // which almost no file has — so a file with a perfectly good
+              // 256 or 320 px item decoded its full frame instead.
+              THUMBNAIL_ITEM_MIN_EDGE
+            );
           } catch (error) {
             url = null;
           }

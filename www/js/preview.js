@@ -217,9 +217,11 @@
         if (url) return { url, orientation: 0, note: '' };
       }
 
-      // HEIC, decoded properly. This is the only place in the app that does
-      // it: the grid's tiles stay on the cheap extraction path, because a
-      // software HEVC decode per tile would be hundreds of milliseconds each.
+      // HEIC, decoded properly — no `maxEdge`, so the primary image at full
+      // resolution. This is the only place in the app that asks for that: the
+      // grid's tiles take the container's own thumbnail item or an extracted
+      // one, because a full software HEVC decode per tile would be hundreds of
+      // milliseconds each.
       if (isHeic(entry.name)) {
         showNote('Decoding…');
         const decoded = await window.ExifHeic.decodeToUrl(entry.path);

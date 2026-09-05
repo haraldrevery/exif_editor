@@ -5,11 +5,15 @@
  *
  * The preview stage asks for no limit and gets a full-resolution decode of the
  * primary image: hundreds of milliseconds, for the one photo somebody is
- * actually looking at. The grid asks for a tile-sized edge, and the worker
- * then decodes the file's embedded `thmb` item instead whenever there is one
- * that big — a kilobyte of HEVC rather than a 12 MP frame. That is what makes
- * it reasonable for the grid to call this at all; the earlier version could
- * only afford it as a last resort for files that had nothing to extract.
+ * actually looking at. The grid asks for a floor, and the worker then decodes
+ * the file's embedded `thmb` item instead whenever there is one at least that
+ * big — a kilobyte of HEVC rather than a 12 MP frame. That is what makes it
+ * reasonable for the grid to call this at all; the earlier version could only
+ * afford it as a last resort for files that had nothing to extract.
+ *
+ * **The floor is not the size the result is stored at.** They are separate
+ * arguments everywhere below, and the one bug this file is most prone to is
+ * passing the store size for both — see `tileThumbnail`.
  *
  * Everything here degrades to `null`. The decoder is an optional vendored
  * dependency (`build_tools/fetch_heic_decoder.py`) and the app is expected to
@@ -289,15 +293,6 @@
     }
   }
 
-  async function decodeToThumbnail(path, maxEdge) {
-    const edge = maxEdge || 256;
-    const hit = await cached(path, edge);
-    if (hit) return hit;
-    const uri = await toThumbnailUri(await decode(path, edge), edge);
-    await remember(path, edge, uri);
-    return uri;
-  }
-
   /**
    * Files already known to carry no thumbnail item worth using.
    *
@@ -307,43 +302,78 @@
    * without this a folder of converter-produced HEICs would re-read every file
    * in full on every scroll past it, for ever, to be told "no" each time.
    *
-   * Keyed by path and edge, and deliberately not persisted: it is cheap to
-   * rebuild, and an edited file must not inherit the old answer.
+   * Keyed by path and *floor*, because the floor is what decides the answer —
+   * "no item of at least 224 px" says nothing about a request for 160. Not
+   * persisted: it is cheap to rebuild, and an edited file must not inherit the
+   * old answer.
    */
   const noThumbnailItem = new Set();
 
+  /** The edge assumed when a caller does not name one. */
+  const DEFAULT_THUMBNAIL_EDGE = 256;
+
   /**
-   * The container's own thumbnail item, or `null` if it has none that big.
+   * A tile-sized thumbnail for `path`, cached, or `null`.
    *
-   * Distinct from `decodeToThumbnail` in what "no" means. This one answers the
-   * question asked; that one treats a missing thumbnail item as a reason to
-   * decode the primary image instead. The grid asks this of every large HEIC
-   * tile, so the difference is a folder that draws in milliseconds against one
-   * that decodes every converter-produced file at full resolution.
+   * Three numbers, and conflating any two of them is a bug that looks like
+   * slowness rather than like breakage:
+   *
+   *   * `maxEdge` is what the result is **stored at** — the cache key, and the
+   *     ceiling the pixels are downscaled to.
+   *   * `minEdge` is the smallest thumbnail item still **worth taking** instead
+   *     of decoding the primary image. Passing `maxEdge` here instead is what
+   *     makes a file with a perfectly good 256 or 320 px `thmb` item decode its
+   *     full 12 MP frame anyway, for failing to fill a 512 px budget it was
+   *     never going to fill. The encoder never scales up, so an item between
+   *     the two is kept at its own size.
+   *   * `thumbnailOnly` decides what "no item that big" **means**: an answer
+   *     (`null`, at the cost of a container parse), or a reason to decode the
+   *     primary image.
    */
-  async function decodeEmbeddedThumbnail(path, maxEdge, minEdge) {
-    const edge = maxEdge || 256;
-    // The floor is deliberately *not* the downscale target. `maxEdge` caps what
-    // gets stored; `minEdge` is the smallest thumbnail still worth having.
-    // Tying the two together would reject a 320x240 thumbnail for failing to
-    // fill a 512 px budget and then draw the 160x120 EXIF one instead — worse
-    // on every axis, and only after paying the whole-file read anyway. The
-    // encoder never scales up, so a thumbnail between the two is kept at its
-    // own size.
+  async function tileThumbnail(path, maxEdge, minEdge, thumbnailOnly) {
+    const edge = maxEdge || DEFAULT_THUMBNAIL_EDGE;
     const floor = minEdge || edge;
     const hit = await cached(path, edge);
     if (hit) return hit;
 
-    const marker = `${edge} ${path}`;
-    if (noThumbnailItem.has(marker)) return null;
+    const marker = `${floor} ${path}`;
+    // Only meaningful for the question that can be answered "no". A full
+    // decode has no such shortcut, and must not take one: it would turn "this
+    // file has no thumbnail item" into "this file has no preview".
+    if (thumbnailOnly && noThumbnailItem.has(marker)) return null;
 
-    const uri = await toThumbnailUri(await decode(path, floor, true), edge);
+    const uri = await toThumbnailUri(await decode(path, floor, thumbnailOnly), edge);
     if (!uri) {
-      noThumbnailItem.add(marker);
+      if (thumbnailOnly) noThumbnailItem.add(marker);
       return null;
     }
     await remember(path, edge, uri);
     return uri;
+  }
+
+  /**
+   * A thumbnail for `path` by whatever route works, decoding the primary image
+   * if that is what it takes.
+   *
+   * The expensive one, and the grid's last resort. It still prefers the
+   * container's own thumbnail item — `minEdge` is what lets it, and leaving it
+   * out is the difference between about a kilobyte of HEVC and a full frame.
+   */
+  function decodeToThumbnail(path, maxEdge, minEdge) {
+    return tileThumbnail(path, maxEdge, minEdge, false);
+  }
+
+  /**
+   * The container's own thumbnail item, or `null` if it has none that big.
+   *
+   * Distinct from `decodeToThumbnail` only in what "no" means. This one answers
+   * the question asked; that one treats a missing thumbnail item as a reason to
+   * decode the primary image instead. The grid asks this of HEIC tiles ahead of
+   * everything else, so the difference is a folder that draws in milliseconds
+   * against one that decodes every converter-produced file at full resolution.
+   */
+  function decodeEmbeddedThumbnail(path, maxEdge, minEdge) {
+    return tileThumbnail(path, maxEdge, minEdge, true);
   }
 
   /**
