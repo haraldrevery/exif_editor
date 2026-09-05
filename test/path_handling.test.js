@@ -21,6 +21,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
+const S = require('../www/js/state.js');
+
 const jsDir = path.join(__dirname, '..', 'www', 'js');
 const sources = fs
   .readdirSync(jsDir)
@@ -121,4 +123,87 @@ test('Rust never hands out a raw canonicalize() result', () => {
         );
     });
   assert.deepEqual(offenders, [], 'these call canonicalize() directly — use library::canonical');
+});
+
+
+/* ── file:// URLs ──────────────────────────────────────────────────────────
+   The Electron shell points `<img src>` straight at the photo, so `fileUrl`
+   is the only thing between a native path and the webview.
+
+   These run the function rather than grepping for it, which is the difference
+   that matters here: `shell_parity.test.js` confirms both shells *have* an
+   `imageUrl`, and did so happily while the Electron one returned a string the
+   URL parser rejects. A name check cannot catch a wrong implementation.     */
+
+/** Parses, or returns null — `new URL` throws on a malformed file URL. */
+function parsed(url) {
+  try {
+    return new URL(url);
+  } catch (_) {
+    return null;
+  }
+}
+
+test('a Windows path becomes a URL a webview will actually load', () => {
+  const url = S.fileUrl('C:\\photos\\a.jpg');
+  // Three slashes. With two, `C:` is parsed as the authority and the whole
+  // thing is rejected — which is what shipped, so every JPEG in the Windows
+  // Electron build failed to load while the parity test stayed green.
+  assert.equal(url, 'file:///C:/photos/a.jpg');
+  const u = parsed(url);
+  assert.ok(u, `not a valid URL: ${url}`);
+  assert.equal(u.host, '', 'the drive letter must not become the host');
+  assert.equal(decodeURIComponent(u.pathname), '/C:/photos/a.jpg');
+});
+
+test('a POSIX path becomes a URL a webview will actually load', () => {
+  const url = S.fileUrl('/home/u/a.jpg');
+  assert.equal(url, 'file:///home/u/a.jpg');
+  assert.equal(decodeURIComponent(parsed(url).pathname), '/home/u/a.jpg');
+});
+
+test('a UNC share keeps its host, because there the authority is real', () => {
+  const url = S.fileUrl('\\\\server\\share\\a.jpg');
+  const u = parsed(url);
+  assert.ok(u, `not a valid URL: ${url}`);
+  assert.equal(u.host, 'server');
+  assert.equal(decodeURIComponent(u.pathname), '/share/a.jpg');
+});
+
+test('characters that would end the path early are encoded', () => {
+  // encodeURI leaves both `#` and `?`. In a path each ends it: a photo called
+  // `holiday?2.jpg` resolves to `holiday`, and the tile silently stays blank.
+  for (const [native, expected] of [
+    ['/p/holiday#2.jpg', '/p/holiday#2.jpg'],
+    ['/p/holiday?2.jpg', '/p/holiday?2.jpg'],
+    ['/p/a b.jpg', '/p/a b.jpg'],
+    ['/p/fjörd.jpg', '/p/fjörd.jpg'],
+    ['C:\\p\\holiday#2.jpg', '/C:/p/holiday#2.jpg'],
+    ['C:\\p\\holiday?2.jpg', '/C:/p/holiday?2.jpg'],
+  ]) {
+    const u = parsed(S.fileUrl(native));
+    assert.ok(u, `not a valid URL for ${native}`);
+    assert.equal(u.search, '', `${native} grew a query string`);
+    assert.equal(u.hash, '', `${native} grew a fragment`);
+    assert.equal(decodeURIComponent(u.pathname), expected);
+  }
+});
+
+test('every path the scanner can produce survives the round trip', () => {
+  // The extensions library.rs actually lists, under both separators. Anything
+  // that comes back unparseable is a photo the Electron build cannot display.
+  const names = ['a.jpg', 'DSC_0001.JPEG', 'scan.tiff', 'img.heic', 'x.webp', 'y.png'];
+  for (const name of names) {
+    for (const full of [`/photos/${name}`, `C:\\photos\\${name}`]) {
+      const url = S.fileUrl(full);
+      assert.ok(parsed(url), `${full} produced an unparseable URL: ${url}`);
+      assert.ok(url.startsWith('file:///'), `${full} lost its third slash: ${url}`);
+    }
+  }
+});
+
+test('nothing usable in, nothing thrown out', () => {
+  for (const bad of [null, undefined, '', 42, {}]) {
+    assert.equal(S.fileUrl(bad), '', `${JSON.stringify(bad)} should give ''`);
+  }
 });

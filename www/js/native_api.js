@@ -29,6 +29,12 @@
 
   /* ── Tauri ───────────────────────────────────────────────────────────── */
 
+  /* A Tauri rejection is always a real refusal. `invoke` has no client-side
+     timeout, so nothing here can give up on a call that is still running, and
+     the backend pre-flights every file before writing any of them. There is
+     therefore no unconfirmed state to represent — which is why only the
+     Electron adapter below carries one. */
+
   const tauriImpl = {
     env: 'tauri',
 
@@ -155,6 +161,39 @@
      protocol, and the page is loaded from file://, so a file:// URL works
      directly.                                                              */
 
+  /**
+   * Marker `core_client.js` puts on an error where the write may have gone
+   * ahead anyway — a request that outran its timeout, or a child that died
+   * mid-batch. See the comment on `UNCONFIRMED` there.
+   */
+  const UNCONFIRMED = 'E_UNCONFIRMED:';
+
+  /**
+   * Turns the marker back into something the caller can branch on.
+   *
+   * It has to travel as text: `ipcRenderer.invoke` serialises a rejection down
+   * to its message and drops every other property, so a boolean set in the
+   * main process does not survive the trip. Electron also wraps the message
+   * ("Error invoking remote method 'apply_edits': Error: …"), which is why the
+   * marker is searched for rather than matched at the start.
+   *
+   * Applied to every call, not only the writes: a read that came back
+   * unconfirmed says the engine is in trouble, and the caller may want to say
+   * so rather than blame the file.
+   */
+  function call(promise) {
+    return promise.catch((error) => {
+      const text = String((error && error.message) || error);
+      const at = text.indexOf(UNCONFIRMED);
+      if (at === -1) throw error;
+      const wrapped = new Error(text.slice(at + UNCONFIRMED.length).trim());
+      // The whole point: "we do not know what happened" is a third answer,
+      // distinct from success and from a refusal that wrote nothing.
+      wrapped.unconfirmed = true;
+      throw wrapped;
+    });
+  }
+
   const electronImpl = {
     env: 'electron',
 
@@ -167,29 +206,31 @@
     writableTags: () => window.exifAPI.writableTags(),
     reportRenderer: (detail) => window.exifAPI.reportRenderer(detail),
 
-    openLibrary: (path) => window.exifAPI.openLibrary(path),
-    rescanLibrary: () => window.exifAPI.rescanLibrary(),
-    readMetadata: (paths) => window.exifAPI.readMetadata(paths),
-    readFields: (paths, tags) => window.exifAPI.readFields(paths, tags),
-    readPreview: (path) => window.exifAPI.readPreview(path),
-    readFileBytes: (path) => window.exifAPI.readFileBytes(path),
+    openLibrary: (path) => call(window.exifAPI.openLibrary(path)),
+    rescanLibrary: () => call(window.exifAPI.rescanLibrary()),
+    readMetadata: (paths) => call(window.exifAPI.readMetadata(paths)),
+    readFields: (paths, tags) => call(window.exifAPI.readFields(paths, tags)),
+    readPreview: (path) => call(window.exifAPI.readPreview(path)),
+    readFileBytes: (path) => call(window.exifAPI.readFileBytes(path)),
     setDirty: (dirty, count) => window.exifAPI.setDirty(dirty, count),
     readThumbCache: (path, edge) => window.exifAPI.readThumbCache(path, edge),
     writeThumbCache: (path, edge, base64) =>
       window.exifAPI.writeThumbCache(path, edge, base64),
-    applyEdit: (paths, edit) => window.exifAPI.applyEdit(paths, edit),
-    applyEdits: (edits) => window.exifAPI.applyEdits(edits),
+    applyEdit: (paths, edit) => call(window.exifAPI.applyEdit(paths, edit)),
+    applyEdits: (edits) => call(window.exifAPI.applyEdits(edits)),
     previewGeotag: (paths, gpxPath, offsetSeconds, maxGapSeconds) =>
-      window.exifAPI.previewGeotag(paths, gpxPath, offsetSeconds, maxGapSeconds ?? null),
-    applyGeotag: (matches) => window.exifAPI.applyGeotag(matches),
-    previewDateShift: (paths, seconds) => window.exifAPI.previewDateShift(paths, seconds),
-    undoLast: () => window.exifAPI.undoLast(),
+      call(window.exifAPI.previewGeotag(paths, gpxPath, offsetSeconds, maxGapSeconds ?? null)),
+    applyGeotag: (matches) => call(window.exifAPI.applyGeotag(matches)),
+    previewDateShift: (paths, seconds) => call(window.exifAPI.previewDateShift(paths, seconds)),
+    undoLast: () => call(window.exifAPI.undoLast()),
     undoAvailable: () => window.exifAPI.undoAvailable(),
 
     imageUrl(path) {
-      // encodeURI, not encodeURIComponent: the slashes must survive. Without
-      // it a photo with a space or a '#' in its name silently fails to load.
-      return `file://${encodeURI(path).replace(/#/g, '%23')}`;
+      // Delegated to `state.js` so the conversion is testable without a
+      // `window` — see `ExifState.fileUrl` for why a native Windows path needs
+      // more than percent-encoding. Read at call time, not load time: this
+      // file is deliberately the first script in <head>, before `state.js`.
+      return window.ExifState.fileUrl(path);
     },
   };
 

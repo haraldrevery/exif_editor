@@ -29,6 +29,13 @@
 //! than returning one photo's metadata under another photo's name. Handing the
 //! user the wrong file's tags is the failure that silently corrupts a library.
 //!
+//! Two things make that hold across a respawn, and both were once assumed
+//! rather than arranged. The counter lives on the **session**, so a number is
+//! never reused by a later child; and each child gets its **own** stderr
+//! channel, so an outgoing reader thread cannot file a chunk — or an EOF —
+//! against the child that replaced it. See `ExifToolSession::next_seq` and
+//! `Inner::stderr`.
+//!
 //! # Threading
 //!
 //! stderr gets its own reader thread. This is not for speed: if stderr's pipe
@@ -40,6 +47,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Guard against a desynchronised stream wedging the app forever. ExifTool
@@ -93,16 +101,34 @@ struct Inner {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
-    /// Monotonic. Never reused within a session, so a stale marker from an
-    /// abandoned request can never be mistaken for a current one.
-    next_seq: u64,
+    /// **This child's own channel, not the session's.**
+    ///
+    /// It used to be one channel shared for the life of the session, reset by
+    /// `spawn`. The reset was not enough: the previous child's reader thread is
+    /// still alive at that moment and takes the lock per line, so after the
+    /// reset it could still file a chunk under a number the *new* child was
+    /// about to use, or reach EOF and set `closed` on the fresh channel — at
+    /// which point `take_stderr` returns `Ok("")`, `has_error()` is false, and
+    /// a write ExifTool refused reads as one that succeeded.
+    ///
+    /// Giving each child its own channel retires that whole class: an orphaned
+    /// reader writes into an `Arc` nothing will ever read again, and drops it
+    /// when it exits.
+    stderr: Arc<(Mutex<StderrChannel>, Condvar)>,
 }
 
 pub struct ExifToolSession {
     exe: PathBuf,
     /// `None` until first use and after a crash; respawned on demand.
     inner: Mutex<Option<Inner>>,
-    stderr: Arc<(Mutex<StderrChannel>, Condvar)>,
+    /// Monotonic **for the life of the session**, which is what the desync
+    /// check needs and what this field used to only claim.
+    ///
+    /// It lived on `Inner` and was initialised to 1 there, so every respawn
+    /// restarted the numbering — after a crash, or after `execute`'s own retry
+    /// calls `discard_child`. The doc comment said "never reused within a
+    /// session" while the code guaranteed only "never reused by one child".
+    next_seq: AtomicU64,
 }
 
 impl ExifToolSession {
@@ -112,7 +138,7 @@ impl ExifToolSession {
         Self {
             exe: exe.into(),
             inner: Mutex::new(None),
-            stderr: Arc::new((Mutex::new(StderrChannel::default()), Condvar::new())),
+            next_seq: AtomicU64::new(1),
         }
     }
 
@@ -164,8 +190,10 @@ impl ExifToolSession {
         }
         let inner = guard.as_mut().expect("just populated");
 
-        let seq = inner.next_seq;
-        inner.next_seq += 1;
+        // From the session, not the child: a number is never reused even
+        // across a respawn, so a marker from an abandoned request can never be
+        // mistaken for a current one.
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
         // Build the batch. -echo4 frames stderr with the same number stdout
         // gets from -execute, so both streams can be attributed to this call.
@@ -191,7 +219,11 @@ impl ExifToolSession {
             .map_err(|e| format!("ExifTool stdin write failed: {e}"))?;
 
         let stdout = read_until_marker(&mut inner.stdout, &format!("{{ready{seq}}}"), seq)?;
-        let stderr = self.take_stderr(seq)?;
+        // Cloned after the read, so the mutable borrow of `inner.stdout` above
+        // has ended. Still under the `inner` lock, so this is the channel
+        // belonging to the child that just answered.
+        let channel = Arc::clone(&inner.stderr);
+        let stderr = take_stderr(&channel, seq)?;
 
         Ok(ExifResponse { stdout, stderr })
     }
@@ -227,16 +259,12 @@ impl ExifToolSession {
         let stdout = BufReader::new(child.stdout.take().ok_or("ExifTool stdout unavailable")?);
         let child_stderr = child.stderr.take().ok_or("ExifTool stderr unavailable")?;
 
-        // Reset framing state: a previous child's partial output must not be
-        // attributed to the new one.
-        {
-            let (lock, condvar) = &*self.stderr;
-            let mut channel = lock.lock().map_err(|_| poisoned())?;
-            *channel = StderrChannel::default();
-            condvar.notify_all();
-        }
+        // A channel of this child's own. See the field's comment: resetting a
+        // shared one left the outgoing reader thread able to write into it.
+        let channel: Arc<(Mutex<StderrChannel>, Condvar)> =
+            Arc::new((Mutex::new(StderrChannel::default()), Condvar::new()));
 
-        let stderr_state = Arc::clone(&self.stderr);
+        let stderr_state = Arc::clone(&channel);
         std::thread::Builder::new()
             .name("exiftool-stderr".into())
             .spawn(move || drain_stderr(child_stderr, stderr_state))
@@ -246,13 +274,24 @@ impl ExifToolSession {
             child,
             stdin,
             stdout,
-            next_seq: 1,
+            stderr: channel,
         })
     }
 
-    /// Collects the stderr chunk for `seq`, waiting for the reader thread.
-    fn take_stderr(&self, seq: u64) -> Result<String, String> {
-        let (lock, condvar) = &*self.stderr;
+}
+
+/// Collects the stderr chunk for `seq` from one child's channel.
+///
+/// A free function taking the channel, rather than a method reaching for a
+/// session-wide one: the channel belongs to the child that just answered on
+/// stdout, so there is no way for this to wait on — or read from — a different
+/// child's framing. See `Inner::stderr`.
+fn take_stderr(
+    channel: &Arc<(Mutex<StderrChannel>, Condvar)>,
+    seq: u64,
+) -> Result<String, String> {
+    let (lock, condvar) = &**channel;
+    {
         let mut channel = lock.lock().map_err(|_| poisoned())?;
         let deadline = std::time::Instant::now() + RESPONSE_TIMEOUT;
         loop {
@@ -284,7 +323,9 @@ impl ExifToolSession {
             }
         }
     }
+}
 
+impl ExifToolSession {
     /// Drops the current child so the next request spawns a fresh one.
     fn discard_child(&self) {
         if let Ok(mut guard) = self.inner.lock() {
@@ -414,20 +455,35 @@ mod tests {
 
     /// Resolves the vendored ExifTool from the repo, skipping the test when it
     /// has not been fetched (a fresh clone has no vendor tree).
+    ///
+    /// **A skip here is a silent pass** — a Rust test that returns has passed —
+    /// so `REVERY_EXIF_REQUIRE_ENGINE` exists to take that away. CI sets it
+    /// after vendoring, which is the one environment where "no engine" must be
+    /// a failure rather than a shrug. See `tests/common` for the full
+    /// reasoning; it is duplicated here because a unit test cannot reach the
+    /// integration suites' shared module.
     fn session() -> Option<ExifToolSession> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
-        let exe = ExifToolSession::locate(root).ok()?;
-        Some(ExifToolSession::new(exe))
+        match ExifToolSession::locate(root) {
+            Ok(exe) => Some(ExifToolSession::new(exe)),
+            Err(why) => {
+                if std::env::var_os("REVERY_EXIF_REQUIRE_ENGINE").is_some() {
+                    panic!(
+                        "REVERY_EXIF_REQUIRE_ENGINE is set, so a missing engine is a \
+                         failure: {why}"
+                    );
+                }
+                eprintln!("SKIPPING (no vendored ExifTool): {why}");
+                None
+            }
+        }
     }
 
     macro_rules! require_exiftool {
         () => {
             match session() {
                 Some(s) => s,
-                None => {
-                    eprintln!("skipping: vendored ExifTool not present");
-                    return;
-                }
+                None => return,
             }
         };
     }
@@ -524,6 +580,65 @@ mod tests {
         let good = s.execute(&["-ver".into()]).unwrap();
         assert!(!good.has_error(), "leaked stderr: {:?}", good.stderr);
         assert!(good.stdout.trim().starts_with("13."));
+    }
+
+    /// The invariant the module header states, checked rather than assumed.
+    ///
+    /// `next_seq` used to live on `Inner` and start at 1 there, so every
+    /// respawn restarted the numbering — which `execute`'s own retry path
+    /// triggers on any transient failure. Numbers were per-child while the
+    /// comment promised per-session.
+    #[test]
+    fn sequence_numbers_are_not_reused_after_a_respawn() {
+        let s = require_exiftool!();
+        s.execute(&["-ver".into()]).unwrap();
+        let before = s.next_seq.load(Ordering::Relaxed);
+        assert!(before > 1, "the first request should have consumed a number");
+
+        // What a crashed child, or `execute`'s retry, does.
+        s.discard_child();
+        s.execute(&["-ver".into()]).unwrap();
+
+        assert!(
+            s.next_seq.load(Ordering::Relaxed) > before,
+            "numbering restarted across the respawn: {before} then {}",
+            s.next_seq.load(Ordering::Relaxed)
+        );
+    }
+
+    /// A dead child's reader thread must not be able to answer for its
+    /// replacement.
+    ///
+    /// The channel was shared for the life of the session and merely reset on
+    /// spawn, which left the outgoing thread free to set `closed` on the fresh
+    /// one — and `take_stderr` reads `closed` as "no stderr", so an ExifTool
+    /// error would read as a clean run. Each child now owns its channel.
+    #[test]
+    fn a_respawned_child_does_not_inherit_the_previous_ones_stderr() {
+        let s = require_exiftool!();
+
+        // Leave a real error on the old child's channel, then replace it.
+        let bad = s
+            .execute(&["-j".into(), "/nonexistent/definitely-not-here.jpg".into()])
+            .unwrap();
+        assert!(bad.has_error(), "expected an error to be framed");
+        s.discard_child();
+
+        // The new child must report its own state, and must still be able to
+        // surface an error — not return empty stderr because a dead thread
+        // marked the channel closed.
+        let good = s.execute(&["-ver".into()]).unwrap();
+        assert!(!good.has_error(), "inherited stderr: {:?}", good.stderr);
+        assert_eq!(good.stderr, "", "inherited stderr: {:?}", good.stderr);
+
+        let bad_again = s
+            .execute(&["-j".into(), "/nonexistent/still-not-here.jpg".into()])
+            .unwrap();
+        assert!(
+            bad_again.has_error(),
+            "the respawned child stopped reporting errors: {:?}",
+            bad_again.stderr
+        );
     }
 
     #[test]

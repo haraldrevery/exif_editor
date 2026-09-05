@@ -216,9 +216,18 @@ mod tests {
     #[test]
     fn the_bundled_binary_lists_the_tags_people_actually_want() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let Ok(exe) = ExifToolSession::locate(root) else {
-            eprintln!("skipping: vendored ExifTool not present");
-            return;
+        // See `exiftool::tests::session` — a skip here is a silent pass, so CI
+        // sets REVERY_EXIF_REQUIRE_ENGINE to make a missing engine fatal.
+        let exe = match ExifToolSession::locate(root) {
+            Ok(exe) => exe,
+            Err(why) => {
+                assert!(
+                    std::env::var_os("REVERY_EXIF_REQUIRE_ENGINE").is_none(),
+                    "REVERY_EXIF_REQUIRE_ENGINE is set, so a missing engine is a failure: {why}"
+                );
+                eprintln!("SKIPPING (no vendored ExifTool): {why}");
+                return;
+            }
         };
         let tags = writable_tags(&ExifToolSession::new(exe)).expect("catalogue");
 

@@ -45,7 +45,7 @@
     return new Date(seconds * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
   }
 
-  function createGeotag({ container, getSelection, onApplied, setStatus }) {
+  function createGeotag({ container, getSelection, onApplied, setStatus, describeWriteFailure }) {
     let trackPath = null;
     let preview = null;
     let offsetSeconds = 0;
@@ -150,7 +150,7 @@
         const outcome = await window.NativeAPI.applyEdit(paths, edit);
         onApplied(outcome, paths.length);
       } catch (error) {
-        setStatus(`Nothing was changed. ${error.message || error}`, true);
+        setStatus(describeWriteFailure(error), true);
       }
     }
 
@@ -284,7 +284,7 @@
         onApplied(outcome, assignments.length);
         await refreshPreview();
       } catch (error) {
-        setStatus(`Nothing was changed. ${error.message || error}`, true);
+        setStatus(describeWriteFailure(error), true);
       }
     }
 

@@ -104,10 +104,16 @@ test('the sidecar implements every command the Electron shell forwards', () => {
 test('the two shells expose the same command names', () => {
   // Tauri registers commands by function name; the sidecar dispatches by
   // string. They must agree, or a feature works in one build and not the other.
+  // `#[tauri::command]` and `#[tauri::command(async)]` alike: most of these
+  // carry `(async)` to keep the work off the UI thread, and a regex that
+  // matched only the bare form silently found six commands instead of
+  // twenty-two. The count guard below is what caught that.
   const tauriCommands = new Set(
-    [...tauriMain.matchAll(/#\[tauri::command\]\s*(?:pub\s+)?(?:async\s+)?fn\s+([a-z_]+)/g)].map(
-      (m) => m[1]
-    )
+    [
+      ...tauriMain.matchAll(
+        /#\[tauri::command(?:\([^)]*\))?\]\s*(?:pub\s+)?(?:async\s+)?fn\s+([a-z_]+)/g
+      ),
+    ].map((m) => m[1])
   );
   assert.ok(tauriCommands.size > 10, `only found ${tauriCommands.size} Tauri commands`);
   const sidecarCommands = new Set(

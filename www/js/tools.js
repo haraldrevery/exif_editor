@@ -19,7 +19,7 @@
     { key: 'rating', label: 'Rating', fields: ['rating'] },
   ];
 
-  function createTools({ container, getSelection, onApplied, setStatus, confirm }) {
+  function createTools({ container, getSelection, onApplied, setStatus, confirm, describeWriteFailure }) {
     let shiftSeconds = 0;
     let shiftRows = null;
     const el = {};
@@ -117,11 +117,44 @@
         shiftable.length === 1 ? 'Shift 1 photo' : `Shift ${shiftable.length} photos`;
     }
 
+    /**
+     * Shifts every selected photo's timestamps.
+     *
+     * **This is the only operation in the app that is not idempotent.** Every
+     * other write sends an absolute value — clear-then-set for a field, a
+     * coordinate pair for GPS — so applying it twice lands the same result.
+     * A shift sends `-AllDates+=H:M:S`, which ExifTool applies relative to
+     * whatever each tag currently holds, so applying it twice moves the clock
+     * twice and the second batch's undo snapshot replaces the first.
+     *
+     * That is survivable as long as the user knows whether the last attempt
+     * landed. When they cannot know — the engine stopped answering mid-batch —
+     * the control is reset so a retry has to be deliberately re-entered rather
+     * than being one more click on a button still showing the old amount.
+     */
     async function applyShift() {
       const { paths } = getSelection();
       if (!paths.length || shiftSeconds === 0) return;
-      await run(paths, { dates: { op: 'shift', seconds: shiftSeconds } }, 'Shifting dates…');
+      const confirmed = await run(
+        paths,
+        { dates: { op: 'shift', seconds: shiftSeconds } },
+        'Shifting dates…'
+      );
+      if (!confirmed) {
+        resetShift();
+        return;
+      }
       await refreshShift();
+    }
+
+    /** Returns the shift controls to zero, so nothing repeats by reflex. */
+    function resetShift() {
+      shiftSeconds = 0;
+      shiftRows = null;
+      el.hours.value = '0';
+      el.minutes.value = '0';
+      el.shiftPreview.hidden = true;
+      el.shiftApply.hidden = true;
     }
 
     /* ── Copy from a photo ───────────────────────────────────────────────── */
@@ -158,20 +191,55 @@
       return section;
     }
 
-    function refreshCopy() {
+    /**
+     * The source photo and the photos it would be copied to.
+     *
+     * `entries` is the selection's metadata with unreadable files *filtered
+     * out*, so it is not index-aligned with `paths`. Reading the source from
+     * `entries[0]` while taking the targets from `paths.slice(1)` therefore
+     * silently disagreed with itself the moment the first selected photo had
+     * no metadata — which happens whenever its read is still in flight, and
+     * permanently for a file ExifTool cannot read, since `refreshPanel`
+     * documents that such a file is *omitted* from the response rather than
+     * returned as null. The source became the second photo, and the first was
+     * excluded from the targets while keeping its own values.
+     *
+     * So the source is resolved by path and the targets are derived from it,
+     * rather than the two being read off separate lists that are assumed to
+     * line up.
+     */
+    function copyPlan() {
       const { paths, entries } = getSelection();
-      const ready = paths.length > 1 && entries.length > 0;
-      el.copyApply.disabled = !ready;
-      el.copyNote.textContent = ready
-        ? `Takes the ticked fields from ${S.basename(entries[0].SourceFile)} ` +
-          `and writes them to the other ${paths.length - 1}.`
-        : 'Select two or more photos. The first is the source.';
+      if (paths.length < 2) return null;
+      const sourcePath = paths[0];
+      const source = S.entryForPath(entries, sourcePath);
+      if (!source) return null;
+      return { source, sourcePath, targets: paths.slice(1) };
+    }
+
+    function refreshCopy() {
+      const { paths } = getSelection();
+      const plan = copyPlan();
+      el.copyApply.disabled = !plan;
+      if (plan) {
+        el.copyNote.textContent =
+          `Takes the ticked fields from ${S.basename(plan.sourcePath)} ` +
+          `and writes them to the other ${plan.targets.length}.`;
+      } else if (paths.length > 1) {
+        // Named rather than left as a dead button: the metadata read may still
+        // be running, and "nothing happens when I click it" is not an answer.
+        el.copyNote.textContent =
+          `Still reading ${S.basename(paths[0])}. The first selected photo is ` +
+          `the source, and its metadata has to be readable first.`;
+      } else {
+        el.copyNote.textContent = 'Select two or more photos. The first is the source.';
+      }
     }
 
     async function applyCopy() {
-      const { paths, entries } = getSelection();
-      if (paths.length < 2 || !entries.length) return;
-      const source = entries[0];
+      const plan = copyPlan();
+      if (!plan) return;
+      const { source, targets } = plan;
 
       const chosen = [...el.copyGroups.querySelectorAll('input:checked')].map(
         (box) => box.dataset.group
@@ -194,8 +262,9 @@
         }
       }
       // The source already has these values; writing to it would rewrite the
-      // file to no effect.
-      await run(paths.slice(1), edit, 'Copying…');
+      // file to no effect. `targets` comes from the same plan the source did,
+      // so the excluded photo is always the one being read from.
+      await run(targets, edit, 'Copying…');
     }
 
     /* ── Strip ───────────────────────────────────────────────────────────── */
@@ -245,13 +314,23 @@
 
     /* ── Shared ──────────────────────────────────────────────────────────── */
 
+    /**
+     * Runs one tool's write.
+     *
+     * Returns false when the outcome is *unknown* rather than merely failed —
+     * the engine stopped answering, so the write may have gone ahead. Only
+     * `applyShift` acts on that, because it is the only caller for which
+     * repeating the action is not harmless.
+     */
     async function run(paths, edit, message) {
       setStatus(message);
       try {
         const outcome = await window.NativeAPI.applyEdit(paths, edit);
         onApplied(outcome, paths.length);
+        return true;
       } catch (error) {
-        setStatus(`Nothing was changed. ${error.message || error}`, true);
+        setStatus(describeWriteFailure(error), true);
+        return !(error && error.unconfirmed);
       }
     }
 

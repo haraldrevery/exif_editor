@@ -11,16 +11,9 @@ use std::path::{Path, PathBuf};
 use revery_exif_core::exiftool::ExifToolSession;
 use revery_exif_core::library;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("tauri/ has a parent")
-        .to_path_buf()
-}
+mod common;
 
-fn source_fixtures() -> PathBuf {
-    repo_root().join("test/fixtures")
-}
+use common::{engine, fixture_dir as source_fixtures, require_fixture};
 
 /// A private copy of the fixture folder, made once per test run.
 ///
@@ -29,46 +22,58 @@ fn source_fixtures() -> PathBuf {
 /// app out — edited the very files the assertions describe, and the suite
 /// started failing for reasons that had nothing to do with the code. Working
 /// on a copy makes the suite independent of whatever else has touched them.
+///
+/// Staging now *panics* rather than falling back to the source directory. The
+/// old fallback quietly turned a staging failure into "run against the
+/// originals", which is the behaviour this function exists to prevent.
 fn fixtures() -> PathBuf {
     use std::sync::OnceLock;
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("revery-read-fixtures-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        if std::fs::create_dir_all(&dir).is_err() {
-            return source_fixtures();
-        }
-        let Ok(entries) = std::fs::read_dir(source_fixtures()) else {
-            return source_fixtures();
-        };
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("cannot stage fixtures in {}: {e}", dir.display()));
+        let entries = std::fs::read_dir(source_fixtures()).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e}. The fixtures are committed to git, so this \
+                 checkout is incomplete.",
+                source_fixtures().display()
+            )
+        });
+        let mut staged = 0;
         for entry in entries.flatten() {
             if entry.path().extension().is_some_and(|e| e == "jpg") {
-                let _ = std::fs::copy(entry.path(), dir.join(entry.file_name()));
+                std::fs::copy(entry.path(), dir.join(entry.file_name()))
+                    .unwrap_or_else(|e| panic!("cannot stage {:?}: {e}", entry.file_name()));
+                staged += 1;
             }
         }
+        assert!(staged > 0, "no JPEG fixtures found in {}", source_fixtures().display());
         dir
     })
     .clone()
 }
 
-/// Skips rather than fails when the vendor tree or fixtures are absent, so a
-/// fresh clone reports a clean run instead of a wall of red.
-fn session() -> Option<ExifToolSession> {
-    if !source_fixtures().join("north_gps.jpg").is_file() {
-        eprintln!("skipping: fixtures missing — run build_tools/make_fixtures.py");
-        return None;
-    }
-    let exe = ExifToolSession::locate(&repo_root()).ok()?;
-    Some(ExifToolSession::new(exe))
-}
-
+/// See `tests/common`: a missing fixture fails, a missing engine skips.
 macro_rules! session_or_skip {
-    () => {
-        match session() {
+    () => {{
+        require_fixture("north_gps.jpg");
+        match engine() {
             Some(s) => s,
             None => return,
         }
-    };
+    }};
+}
+
+/// Copies the HEIC fixture too; `fixtures()` only carries the JPEGs across.
+fn heic_fixture() -> PathBuf {
+    let source = require_fixture("phone.heic");
+    let dest = fixtures().join("phone.heic");
+    if !dest.is_file() {
+        std::fs::copy(&source, &dest).expect("stage phone.heic");
+    }
+    dest
 }
 
 fn read_one(session: &ExifToolSession, name: &str) -> serde_json::Value {
@@ -426,24 +431,10 @@ fn locate_names_the_fix_when_exiftool_is_absent() {
    HEIC — the format the webview cannot decode
 ══════════════════════════════════════════════════════════════════════════ */
 
-/// Copies the HEIC fixture too; `fixtures()` only carries the JPEGs across.
-fn heic_fixture() -> Option<PathBuf> {
-    let source = source_fixtures().join("phone.heic");
-    if !source.is_file() {
-        eprintln!("skipping: phone.heic missing — see build_tools/make_fixtures.py");
-        return None;
-    }
-    let dest = fixtures().join("phone.heic");
-    if !dest.is_file() {
-        std::fs::copy(&source, &dest).ok()?;
-    }
-    Some(dest)
-}
-
 #[test]
 fn heic_metadata_reads_like_any_other_format() {
     let s = session_or_skip!();
-    let Some(path) = heic_fixture() else { return };
+    let path = heic_fixture();
     let value = library::read_metadata(&s, &[path]).expect("read");
     let entry = &value[0];
     assert_eq!(entry["File:FileType"].as_str(), Some("HEIC"));
@@ -461,7 +452,7 @@ fn heic_metadata_reads_like_any_other_format() {
 #[test]
 fn a_heic_preview_can_be_extracted() {
     let s = session_or_skip!();
-    let Some(path) = heic_fixture() else { return };
+    let path = heic_fixture();
     let preview = library::extract_preview(&s, &path)
         .expect("extraction should succeed")
         .expect("phone.heic carries an EXIF thumbnail");
@@ -479,7 +470,7 @@ fn a_heic_preview_can_be_extracted() {
 fn a_heic_is_flagged_as_needing_extraction() {
     // The grid tries extraction first for HEIC, because the webview will fail.
     assert!(library::needs_extracted_preview(Path::new("phone.heic")));
-    let Some(path) = heic_fixture() else { return };
+    let path = heic_fixture();
     let entries = library::scan_folder(path.parent().unwrap()).expect("scan");
     let heic = entries.iter().find(|e| e.name == "phone.heic").expect("listed");
     assert!(heic.needs_preview);

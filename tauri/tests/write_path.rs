@@ -14,34 +14,25 @@ use revery_exif_core::exiftool::ExifToolSession;
 use revery_exif_core::library::{self, GpsPosition};
 use revery_exif_core::write::{self, FieldEdit, GpsEdit, PhotoEdit, TagEdit};
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("tauri/ has a parent")
-        .to_path_buf()
-}
+mod common;
 
-fn fixtures() -> PathBuf {
-    repo_root().join("test/fixtures")
-}
+use common::{engine, fixture_dir as fixtures, require_fixture};
 
-fn session() -> Option<ExifToolSession> {
-    if !fixtures().join("north_gps.jpg").is_file() {
-        eprintln!("skipping: fixtures missing — run build_tools/make_fixtures.py");
-        return None;
-    }
-    ExifToolSession::locate(&repo_root())
-        .ok()
-        .map(ExifToolSession::new)
-}
-
+/// The engine, or an early return when it has not been vendored.
+///
+/// **Only the engine may skip.** A missing fixture panics inside
+/// `require_fixture`, because fixtures are committed — see `tests/common`.
 macro_rules! session_or_skip {
-    () => {
-        match session() {
+    () => {{
+        // Ordered deliberately: the fixture check runs first, so an incomplete
+        // checkout fails even on a machine with no vendor tree. Reversed, a
+        // fresh clone would skip past a broken checkout and report success.
+        require_fixture("north_gps.jpg");
+        match engine() {
             Some(s) => s,
             None => return,
         }
-    };
+    }};
 }
 
 /// A scratch directory holding a copy of one fixture, removed on drop.
@@ -1326,10 +1317,9 @@ fn stripping_a_whole_selection_reports_per_file() {
 /// is an assumption, and this is the format where a broken write would hurt
 /// most — it is what phones produce.
 fn heic_scratch(name: &str) -> Option<Scratch> {
-    if !fixtures().join("phone.heic").is_file() {
-        eprintln!("skipping: phone.heic missing — see build_tools/make_fixtures.py");
-        return None;
-    }
+    // Committed like every other fixture, so its absence is a broken checkout
+    // rather than something to skip past.
+    require_fixture("phone.heic");
     Some(Scratch::new(name, "phone.heic"))
 }
 
@@ -1633,4 +1623,159 @@ fn a_raw_tag_edit_can_be_undone() {
     let undone = revery_exif_core::undo::undo_last(&scratch.dir).expect("undo");
     assert_eq!(undone.restored, 1);
     assert_eq!(scratch.bytes(), before, "the file was not restored exactly");
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   CONCURRENCY
+
+   The Tauri commands used to be synchronous, which meant they ran one at a
+   time on the UI thread and nothing here could overlap. That froze the window
+   for the length of a batch, so the commands are `async` now — and these are
+   the assertions that had to exist before that was safe to do.
+══════════════════════════════════════════════════════════════════════════ */
+
+/// Two batches at once must not destroy each other's undo.
+///
+/// `UndoBatch::begin` opens by deleting the store, so without serialisation:
+///
+/// ```text
+///   A  begin ── snapshot ─────────────── finish (manifest names A's snapshots)
+///   B          begin ← deletes the store, taking A's snapshots with it
+/// ```
+///
+/// and undoing reports "the saved copy is missing" for every file it just
+/// promised to restore. `write::MUTATION_LOCK` is what makes this pass.
+#[test]
+fn overlapping_batches_do_not_destroy_each_other() {
+    let s = std::sync::Arc::new(session_or_skip!());
+
+    let dir = std::env::temp_dir().join(format!("revery-concurrent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A is deliberately long and B deliberately short, and B starts a moment
+    // late, so B's `begin` lands in the middle of A rather than depending on
+    // the scheduler to produce the overlap by chance.
+    const A_FILES: usize = 16;
+    const B_FILES: usize = 2;
+    let total = A_FILES + B_FILES;
+    let mut originals = Vec::new();
+    for i in 0..total {
+        let file = dir.join(format!("p{i}.jpg"));
+        std::fs::copy(fixtures().join("no_gps.jpg"), &file).unwrap();
+        originals.push((file.clone(), std::fs::read(&file).unwrap()));
+    }
+
+    let batch = |s: std::sync::Arc<ExifToolSession>, dir: PathBuf, range: std::ops::Range<usize>, label: &'static str, delay_ms: u64| {
+        std::thread::spawn(move || {
+            if delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            let edits: Vec<(String, PhotoEdit)> = range
+                .map(|i| {
+                    (
+                        dir.join(format!("p{i}.jpg")).to_string_lossy().into_owned(),
+                        edit_of(vec![("title", set(serde_json::json!(label)))]),
+                    )
+                })
+                .collect();
+            write::apply_per_file(&s, &dir, &edits)
+        })
+    };
+
+    let long = batch(std::sync::Arc::clone(&s), dir.clone(), 0..A_FILES, "long", 0);
+    let short = batch(std::sync::Arc::clone(&s), dir.clone(), A_FILES..total, "short", 15);
+
+    for outcome in [long.join().unwrap(), short.join().unwrap()] {
+        let outcome = outcome.expect("batch should not fail outright");
+        assert_eq!(outcome.failed, 0, "a file failed: {:?}", outcome.results);
+    }
+
+    // Whichever batch finished last owns the store, and its manifest must name
+    // snapshots that still exist. The failure guarded against is a manifest
+    // promising restores it cannot perform — every entry reporting "the saved
+    // copy is missing" because the other batch's `begin` deleted them.
+    let outcome = revery_exif_core::undo::undo_last(&dir).expect("undo should be available");
+    assert!(
+        outcome.failed.is_empty(),
+        "undo could not restore what it promised: {:?}",
+        outcome.failed
+    );
+    assert!(outcome.restored > 0, "the manifest restored nothing");
+
+    // Everything it claimed to restore is byte-identical to how it started.
+    let restored = originals
+        .iter()
+        .filter(|(path, before)| std::fs::read(path).unwrap() == *before)
+        .count();
+    assert_eq!(
+        restored, outcome.restored,
+        "undo reported {} restored but {restored} files match their original bytes",
+        outcome.restored
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A folder opening mid-write must not delete the write's staged temp.
+///
+/// `sweep_stale_temps` removes `.revery_exif.tmp` siblings, which is exactly
+/// what a running write has staged and not yet renamed. Left unserialised, the
+/// sweep is indistinguishable from crash cleanup and takes live work with it.
+#[test]
+fn a_sweep_cannot_delete_a_running_writes_temp() {
+    let s = std::sync::Arc::new(session_or_skip!());
+
+    let dir = std::env::temp_dir().join(format!("revery-sweeprace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..8 {
+        std::fs::copy(fixtures().join("no_gps.jpg"), dir.join(format!("p{i}.jpg"))).unwrap();
+    }
+
+    let writer = {
+        let s = std::sync::Arc::clone(&s);
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            let edits: Vec<(String, PhotoEdit)> = (0..8)
+                .map(|i| {
+                    (
+                        dir.join(format!("p{i}.jpg")).to_string_lossy().into_owned(),
+                        edit_of(vec![("title", set(serde_json::json!("kept")))]),
+                    )
+                })
+                .collect();
+            write::apply_per_file(&s, &dir, &edits)
+        })
+    };
+
+    // Hammer the sweep while the batch runs.
+    let sweeper = {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            for _ in 0..40 {
+                write::sweep_stale_temps(&dir);
+                std::thread::yield_now();
+            }
+        })
+    };
+
+    let outcome = writer.join().unwrap().expect("the batch should not fail outright");
+    sweeper.join().unwrap();
+
+    assert_eq!(
+        outcome.failed, 0,
+        "a concurrent sweep destroyed a staged write: {:?}",
+        outcome.results
+    );
+    // Every file got the edit, rather than some being lost to the sweep.
+    for i in 0..8 {
+        let read = library::read_metadata(&s, &[dir.join(format!("p{i}.jpg"))]).unwrap();
+        assert_eq!(
+            read.get(0).and_then(|e| e.get("XMP:Title")).and_then(|v| v.as_str()),
+            Some("kept"),
+            "p{i}.jpg did not keep its edit"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
 }

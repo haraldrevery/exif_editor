@@ -438,3 +438,34 @@ test('drafts never carry a baseline', () => {
     'tagPending',
   ]);
 });
+
+/* ── Pairing an entry to the path it was asked for ─────────────────────────
+   `entries` is the selection's metadata with unreadable files filtered out,
+   so it is not index-aligned with `paths`. The Tools tab took its copy source
+   from `entries[0]` and its targets from `paths.slice(1)` as though it were.  */
+
+test('an entry is found by path, not by position', () => {
+  const entries = [
+    { SourceFile: '/photos/b.jpg', 'XMP:Title': 'bee' },
+    { SourceFile: '/photos/c.jpg', 'XMP:Title': 'sea' },
+  ];
+  // a.jpg is selected first but unreadable, so it is absent from `entries`.
+  // Reading position 0 would hand back b.jpg's tags under a.jpg's name.
+  assert.equal(S.entryForPath(entries, '/photos/a.jpg'), null);
+  assert.equal(S.entryForPath(entries, '/photos/b.jpg')['XMP:Title'], 'bee');
+  assert.equal(S.entryForPath(entries, '/photos/c.jpg')['XMP:Title'], 'sea');
+});
+
+test('pairing works across the separator boundary', () => {
+  // Rust hands out native paths; ExifTool always reports forward slashes. On
+  // Windows the two strings for one file never match without normalising.
+  const entries = [{ SourceFile: 'C:/photos/a.jpg', 'XMP:Title': 'north' }];
+  assert.equal(S.entryForPath(entries, 'C:\\photos\\a.jpg')['XMP:Title'], 'north');
+});
+
+test('nothing usable in, null out', () => {
+  assert.equal(S.entryForPath([], '/photos/a.jpg'), null);
+  assert.equal(S.entryForPath(null, '/photos/a.jpg'), null);
+  assert.equal(S.entryForPath([{ 'XMP:Title': 'no SourceFile' }], '/photos/a.jpg'), null);
+  assert.equal(S.entryForPath([{ SourceFile: '/photos/a.jpg' }], ''), null);
+});

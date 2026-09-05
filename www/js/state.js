@@ -296,6 +296,69 @@
     return typeof path === 'string' ? path.replace(/\\/g, '/') : '';
   }
 
+  /**
+   * A `file://` URL for a local path, correct on both platforms.
+   *
+   * The Electron shell loads the page from `file://` and points `<img src>`
+   * straight at the photo, so this is the only thing standing between a native
+   * path and the webview. It lives here, beside `normalisePath` and
+   * `basename`, because it is the same problem those two solve — Rust hands
+   * the frontend a *native* path — and because a function in `native_api.js`
+   * cannot be tested without a `window`.
+   *
+   * Three things have to happen, and the previous version did only the third:
+   *
+   *   * **Backslashes become forward slashes.** `encodeURI` percent-encodes a
+   *     backslash rather than treating it as a separator.
+   *   * **A drive letter needs a third slash.** `C:/photos/a.jpg` with only two
+   *     makes `C:` the URL's *authority*, and `file://C:/photos/a.jpg` is not
+   *     merely wrong — the WHATWG parser rejects it outright. `file:///C:/…`
+   *     is the spelling Windows accepts.
+   *   * **`#` and `?` must be encoded.** `encodeURI` leaves both, and in a path
+   *     both end it early: a photo named `holiday?2.jpg` silently resolves to
+   *     `holiday`.
+   *
+   * A UNC share (`\\server\share`) is the one case where the authority is
+   * real, so it keeps two slashes rather than gaining a third.
+   *
+   * Not handled: the `\\?\` extended-length prefix, which has no valid
+   * `file://` spelling. `library::canonical` strips it except for paths past
+   * MAX_PATH, reserved DOS names and UNC shares — the same narrow case that
+   * module already documents as exposed.
+   */
+  function fileUrl(path) {
+    if (typeof path !== 'string' || !path) return '';
+    let forward = path.replace(/\\/g, '/');
+    const unc = forward.startsWith('//');
+    if (!unc && !forward.startsWith('/')) forward = `/${forward}`;
+    const encoded = encodeURI(forward).replace(/[?#]/g, (c) => (c === '#' ? '%23' : '%3F'));
+    return `file:${unc ? '' : '//'}${encoded}`;
+  }
+
+  /**
+   * The metadata entry for `path`, or null.
+   *
+   * Pairs by normalised name rather than by position, and exists because doing
+   * that by hand went wrong: the Tools tab read its copy source from
+   * `entries[0]` while taking its targets from `paths.slice(1)`, on the
+   * assumption the two lists line up. They do not — `entries` has unreadable
+   * files filtered out, and `refreshPanel` documents that ExifTool *omits* a
+   * file it cannot read rather than returning null for it. The source silently
+   * became the second photo while the first was excluded from the targets.
+   *
+   * The same pairing is done inline by `refreshPanel` and the CSV export, both
+   * of which get it right and both of which say why in a comment. This is the
+   * version anything new should reach for.
+   */
+  function entryForPath(entries, path) {
+    const wanted = normalisePath(path);
+    if (!wanted) return null;
+    for (const entry of entries || []) {
+      if (entry && normalisePath(entry.SourceFile) === wanted) return entry;
+    }
+    return null;
+  }
+
   function basename(path) {
     if (typeof path !== 'string' || !path) return '';
     const parts = path.split(/[\\/]/);
@@ -792,6 +855,8 @@
     filterEntries,
     basename,
     normalisePath,
+    fileUrl,
+    entryForPath,
     lockedReason,
     isEditableValue,
     countChanges,

@@ -63,11 +63,36 @@ struct DirtyDrafts(Mutex<usize>);
 
 /* ══════════════════════════════════════════════════════════════════════════
    COMMANDS
+
+   # Why most of these say `#[tauri::command(async)]`
+
+   A command without it is `ExecutionContext::Blocking`: the generated wrapper
+   calls the function inline, on the thread the IPC message arrived on, which
+   is the webview's — the UI thread. Everything below that touches ExifTool or
+   walks the filesystem therefore froze the window for as long as it ran. A
+   two-hundred-file batch is minutes of an unresponsive window, with the OS
+   offering to kill the app *while it is replacing photographs*; `writable_tags`
+   is three seconds on the first click of the tag picker.
+
+   `(async)` on a synchronous function moves the call onto Tauri's async
+   runtime instead. The function is unchanged — no signature, no `.await` — so
+   this is a scheduling change and nothing else.
+
+   **It is only safe because `write::MUTATION_LOCK` exists.** Running these
+   concurrently means two batches can reach the write path at once, and they
+   share one undo store whose `begin` starts by deleting it — see the comment
+   on that lock, and the two tests in `tests/write_path.rs` that fail without
+   it. Serialisation used to be a side effect of running on one thread; it is
+   now stated where it can be relied on.
+
+   The commands that stay blocking do so because they are genuinely trivial:
+   a lock and a copy (`set_dirty`), an `eprintln!` (`report_renderer`), one
+   `is_file` (`undo_available`), reading argv (`initial_folder`).
 ══════════════════════════════════════════════════════════════════════════ */
 
 /// Opens a folder and returns its photos. This is what grants access to a
 /// location; every later command is confined to what is set here.
-#[tauri::command]
+#[tauri::command(async)]
 fn open_library(
     path: String,
     app: tauri::AppHandle,
@@ -120,7 +145,7 @@ fn open_library(
 }
 
 /// Re-scans the open folder, for the refresh button.
-#[tauri::command]
+#[tauri::command(async)]
 fn rescan_library(root: State<'_, LibraryRoot>) -> Result<Vec<PhotoEntry>, String> {
     library::scan_folder(&root.get()?)
 }
@@ -129,7 +154,7 @@ fn rescan_library(root: State<'_, LibraryRoot>) -> Result<Vec<PhotoEntry>, Strin
 ///
 /// Batched deliberately: one ExifTool round trip for a whole selection rather
 /// than one per file.
-#[tauri::command]
+#[tauri::command(async)]
 fn read_metadata(
     paths: Vec<String>,
     root: State<'_, LibraryRoot>,
@@ -148,7 +173,7 @@ fn read_metadata(
 /// What the CSV export uses. `read_metadata` returns everything, which is
 /// right for one selection and wrong for a whole folder — see
 /// `library::read_fields` for the size arithmetic.
-#[tauri::command]
+#[tauri::command(async)]
 fn read_fields(
     paths: Vec<String>,
     tags: Vec<String>,
@@ -167,7 +192,7 @@ fn read_fields(
 ///
 /// Returns `None` for the rare file that has no preview at all; the grid shows
 /// a placeholder rather than treating that as a failure.
-#[tauri::command]
+#[tauri::command(async)]
 fn read_preview(
     path: String,
     root: State<'_, LibraryRoot>,
@@ -182,7 +207,7 @@ fn read_preview(
 /// Confined to the open folder by the same guard as everything else, and
 /// capped — see `library::read_file_bytes` for why the frontend cannot just
 /// fetch the file itself in either shell.
-#[tauri::command]
+#[tauri::command(async)]
 fn read_file_bytes(path: String, root: State<'_, LibraryRoot>) -> Result<String, String> {
     library::read_file_bytes(&root.get()?, &path)
 }
@@ -191,7 +216,7 @@ fn read_file_bytes(path: String, root: State<'_, LibraryRoot>) -> Result<String,
 ///
 /// Confined to the open folder like every other path-taking command, so this
 /// cannot be used to ask whether an arbitrary file exists.
-#[tauri::command]
+#[tauri::command(async)]
 fn read_thumb_cache(
     path: String,
     edge: u32,
@@ -207,7 +232,7 @@ fn read_thumb_cache(
 /// worker — linking libheif into the core would put a C++ dependency where
 /// there is currently none. So the bytes come *back* across the boundary, and
 /// `thumbcache::write` is where they are checked before they reach the disk.
-#[tauri::command]
+#[tauri::command(async)]
 fn write_thumb_cache(
     path: String,
     edge: u32,
@@ -223,7 +248,7 @@ fn write_thumb_cache(
 /// Built once per session and cached. Called on the first "Add tag…" click
 /// rather than at startup, because it costs seconds and most sessions never
 /// need it.
-#[tauri::command]
+#[tauri::command(async)]
 fn writable_tags(
     engine: State<'_, Engine>,
     cache: State<'_, TagCatalogue>,
@@ -240,7 +265,7 @@ fn writable_tags(
 
 /// Reports the engine version, so the UI can show what is actually running and
 /// surface a missing-vendor-tree failure at startup rather than on first use.
-#[tauri::command]
+#[tauri::command(async)]
 fn engine_version(engine: State<'_, Engine>) -> Result<String, String> {
     let response = engine.0.execute(&["-ver".into()])?;
     Ok(response.stdout.trim().to_string())
@@ -251,7 +276,7 @@ fn engine_version(engine: State<'_, Engine>) -> Result<String, String> {
 /// Every file is pre-flighted before any is written, and the result carries a
 /// per-file outcome — a batch where three of fifty fail is neither a success
 /// nor a failure, and the caller has to be able to say which three.
-#[tauri::command]
+#[tauri::command(async)]
 fn apply_edit(
     paths: Vec<String>,
     edit: PhotoEdit,
@@ -271,7 +296,7 @@ fn apply_edit(
 /// `write::apply_per_file` is the same pre-flight-then-write machinery
 /// `apply_edit` uses, differing only in taking an edit per file. `apply_geotag`
 /// has been going through it since Phase 4.
-#[tauri::command]
+#[tauri::command(async)]
 fn apply_edits(
     edits: Vec<(String, PhotoEdit)>,
     root: State<'_, LibraryRoot>,
@@ -344,7 +369,7 @@ async fn export_csv(
 /// The preview and the write share this matching, so what the review shows is
 /// exactly what lands. A preview produced by different code than the write is
 /// a preview that eventually lies.
-#[tauri::command]
+#[tauri::command(async)]
 fn preview_geotag(
     paths: Vec<String>,
     gpx_path: String,
@@ -376,7 +401,7 @@ fn preview_geotag(
 ///
 /// Takes the matches rather than re-deriving them, so what was reviewed is
 /// exactly what is written. Photos that did not match are simply absent.
-#[tauri::command]
+#[tauri::command(async)]
 fn apply_geotag(
     matches: Vec<GeotagAssignment>,
     root: State<'_, LibraryRoot>,
@@ -408,7 +433,7 @@ struct GeotagAssignment {
 ///
 /// The same arithmetic the write path verifies against, so the preview cannot
 /// promise a timestamp the write then fails to produce.
-#[tauri::command]
+#[tauri::command(async)]
 fn preview_date_shift(
     paths: Vec<String>,
     seconds: i64,
@@ -461,7 +486,7 @@ struct DateShiftRow {
 }
 
 /// Restores the files changed by the last batch.
-#[tauri::command]
+#[tauri::command(async)]
 fn undo_last(root: State<'_, LibraryRoot>) -> Result<undo::UndoOutcome, String> {
     undo::undo_last(&root.get()?)
 }

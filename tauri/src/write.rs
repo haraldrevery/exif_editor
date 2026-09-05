@@ -30,11 +30,61 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
 use crate::exiftool::ExifToolSession;
 use crate::library::{self, GpsPosition};
+
+/* ══════════════════════════════════════════════════════════════════════════
+   SERIALISING MUTATIONS
+══════════════════════════════════════════════════════════════════════════ */
+
+/// Held for the whole of any operation that changes files on disk.
+///
+/// # Why this exists
+///
+/// Everything below was written when exactly one mutation could be in flight:
+/// the Tauri commands were synchronous, so they ran one at a time on the UI
+/// thread, and the Electron sidecar reads stdin in a single loop. Neither is a
+/// guarantee anyone wrote down, and the first — the accidental one — had to go,
+/// because a two-hundred-file batch froze the window while it ran.
+///
+/// Taking it away without this lock would have been worse than the freeze.
+/// Two overlapping batches share one undo store, and `UndoBatch::begin` opens
+/// by deleting it:
+///
+/// ```text
+///   batch A  begin ── snapshot a.jpg, b.jpg ─────── finish (writes manifest)
+///   batch B          begin  ← removes the store, and A's snapshots with it
+/// ```
+///
+/// A then names snapshots that are gone, and undoing reports "the saved copy
+/// is missing" for every file it promised to restore. `sweep_stale_temps` is
+/// the same shape from the other side: it deletes `.revery_exif.tmp` siblings,
+/// which is exactly what a concurrent write has staged and not yet renamed.
+///
+/// So the invariant is stated here rather than inherited from whichever thread
+/// happened to call: **one mutating operation at a time, per process.** Reads
+/// are unaffected and stay concurrent; they are serialised further down by the
+/// single ExifTool session anyway.
+///
+/// Process-wide rather than per-folder because the things being protected are
+/// process-wide: one undo store at a time, one engine, one temp-file namespace.
+static MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Takes the mutation lock, recovering from a panic in a previous holder.
+///
+/// Poisoning is not useful here. The lock guards no shared in-memory state —
+/// every operation under it re-reads the filesystem — so a panicked predecessor
+/// leaves nothing for the next caller to misread. Propagating the poison would
+/// only turn one failed write into a permanently unusable app.
+pub(crate) fn lock_mutations() -> MutexGuard<'static, ()> {
+    MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
    FIELD DEFINITIONS
@@ -639,6 +689,7 @@ pub fn apply_edit(
     path: &str,
     edit: &PhotoEdit,
 ) -> Result<WriteOutcome, String> {
+    let _mutations = lock_mutations();
     let target = library::resolve_within(root, path)?;
     if edit.is_empty() {
         return Ok(WriteOutcome {
@@ -1106,6 +1157,10 @@ fn sync_parent_dir(path: &Path) {
 /// leaves a `.revery_exif.tmp` sibling; the original is intact, but the stray
 /// file would otherwise accumulate in the user's photo folder forever.
 pub fn sweep_stale_temps(root: &Path) -> usize {
+    // A staged temp belonging to a *running* write looks exactly like one left
+    // by a crash. The lock is what tells them apart: no write can be in flight
+    // while this holds it.
+    let _mutations = lock_mutations();
     let Ok(dir) = std::fs::read_dir(root) else {
         return 0;
     };
@@ -1184,6 +1239,9 @@ pub fn apply_per_file(
     if edits.is_empty() {
         return Err("No photos were selected.".into());
     }
+    // Held across both passes, so the pre-flight's answer is still true when
+    // the writes run and no other batch can clear the undo store in between.
+    let _mutations = lock_mutations();
 
     // Pass one: resolve, validate and pre-flight *everything* before writing
     // anything. Building each edit's arguments here also means an impossible

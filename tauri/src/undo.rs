@@ -174,6 +174,10 @@ pub fn is_available(library_root: &Path) -> bool {
 
 /// Restores the last batch.
 pub fn undo_last(library_root: &Path) -> Result<UndoOutcome, String> {
+    // Renaming snapshots back over photos is a mutation like any other, and
+    // must not interleave with a batch renaming temps over the same names.
+    // See `write::MUTATION_LOCK`.
+    let _mutations = crate::write::lock_mutations();
     let dir = library_root.join(STORE_DIR);
     let manifest_path = dir.join(MANIFEST);
     let raw = std::fs::read(&manifest_path)
@@ -246,6 +250,9 @@ fn restore_by_copy(snapshot: &Path, original: &Path) -> Result<(), String> {
 /// restart the snapshots are just hidden files consuming directory entries,
 /// and on a copy-fallback filesystem, real space.
 pub fn sweep(library_root: &Path) -> bool {
+    // Deleting the store while a batch is snapshotting into it would leave
+    // that batch naming files that no longer exist.
+    let _mutations = crate::write::lock_mutations();
     let dir = library_root.join(STORE_DIR);
     dir.exists() && std::fs::remove_dir_all(&dir).is_ok()
 }

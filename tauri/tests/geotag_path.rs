@@ -11,34 +11,19 @@ use revery_exif_core::gpx::{self, NoMatch, Track, DEFAULT_MAX_GAP_SECS};
 use revery_exif_core::library;
 use revery_exif_core::write::{self, GpsEdit, PhotoEdit};
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("tauri/ has a parent")
-        .to_path_buf()
-}
+mod common;
 
-fn fixtures() -> PathBuf {
-    repo_root().join("test/fixtures")
-}
+use common::{engine, fixture_dir as fixtures, require_fixture};
 
-fn session() -> Option<ExifToolSession> {
-    if !fixtures().join("north_gps.jpg").is_file() {
-        eprintln!("skipping: fixtures missing — run build_tools/make_fixtures.py");
-        return None;
-    }
-    ExifToolSession::locate(&repo_root())
-        .ok()
-        .map(ExifToolSession::new)
-}
-
+/// See `tests/common`: a missing fixture fails, a missing engine skips.
 macro_rules! session_or_skip {
-    () => {
-        match session() {
+    () => {{
+        require_fixture("north_gps.jpg");
+        match engine() {
             Some(s) => s,
             None => return,
         }
-    };
+    }};
 }
 
 /// A folder of photos with known capture times, and a track covering them.

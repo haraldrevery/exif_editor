@@ -36,8 +36,25 @@
   let selection = S.createSelection();
   /** path -> ExifTool tag object, for files whose metadata has been read. */
   const metadataCache = new Map();
-  /** Guards against an older, slower read overwriting a newer selection. */
+  /**
+   * Guards against an older, slower read overwriting a newer selection.
+   *
+   * **Bumped by everything that changes what should be on screen**, not only
+   * by the read itself — via `invalidateReads()`. It used to be incremented
+   * only on `refreshPanel`'s slow path, so the two paths that return early
+   * (everything already cached, nothing selected) left an in-flight read
+   * believing it was still current. Selecting an uncached photo and then a
+   * cached one repainted the panel with the first photo's metadata beside the
+   * second photo's drafts, and `loadFolder` could have a read from the folder
+   * just closed repopulate the cache it had cleared a moment earlier.
+   */
   let readToken = 0;
+
+  /** Declares every read now in flight stale. Returns the new token. */
+  function invalidateReads() {
+    readToken += 1;
+    return readToken;
+  }
 
   /**
    * path -> what the user has typed but not applied.
@@ -236,6 +253,32 @@
   }
 
   /**
+   * What to say when a write fails, given what is actually known.
+   *
+   * "Nothing was changed" used to be said for every rejection, on the
+   * reasoning that pre-flight runs before anything is written. That holds for
+   * an error the engine *returned* — it validated the batch and refused. It
+   * does not hold for a request that timed out or an engine that died
+   * mid-batch, where the write may have gone ahead and this side simply lost
+   * track of it. `NativeAPI` marks those `unconfirmed`.
+   *
+   * Naming the difference matters more than the wording: told "nothing was
+   * changed", the obvious next move is to press the button again, and the date
+   * shift is the one operation that is not idempotent.
+   */
+  function describeWriteFailure(error) {
+    const detail = (error && error.message) || error;
+    if (error && error.unconfirmed) {
+      return (
+        `Lost contact with the metadata engine, so it is not known whether ` +
+        `your photos were changed. Check them before trying again — repeating ` +
+        `an edit that did go through can apply it twice. ${detail}`
+      );
+    }
+    return `Nothing was changed. ${detail}`;
+  }
+
+  /**
    * Writes the selection's drafts, one edit per photo.
    *
    * Per file rather than one edit fanned across the selection, and in a single
@@ -261,11 +304,18 @@
       await refreshUndo();
       reportBatch(outcome, groups.length);
     } catch (error) {
-      // Pre-flight runs before anything is written, so an error here means
-      // nothing changed at all. Say so, rather than leaving the user unsure
-      // whether some of their photos were modified — and keep every draft,
-      // because none of them were saved.
-      setStatus(`Nothing was changed. ${error.message || error}`, true);
+      // Drafts are kept either way — nothing was confirmed written, so
+      // discarding them could throw away work that never landed. What changes
+      // is what the user is told, because only one of these two answers makes
+      // pressing the button again a safe thing to do.
+      setStatus(describeWriteFailure(error), true);
+      if (error && error.unconfirmed) {
+        // The files on disk may have moved underneath every cached read.
+        metadataCache.clear();
+        invalidatePreviews();
+        await refreshPanel();
+        await refreshUndo();
+      }
     }
   }
 
@@ -438,7 +488,7 @@
       await refreshUndo();
       reportBatch(outcome, selection.paths.length);
     } catch (error) {
-      setStatus(`Nothing was changed. ${error.message || error}`, true);
+      setStatus(describeWriteFailure(error), true);
     }
   }
 
@@ -476,6 +526,7 @@
       reportBatch(outcome, count);
     },
     setStatus: (message, isError) => setStatus(message, isError),
+    describeWriteFailure,
     confirm: askConfirm,
   });
 
@@ -525,6 +576,7 @@
       reportBatch(outcome, count);
     },
     setStatus: (message, isError) => setStatus(message, isError),
+    describeWriteFailure,
   });
 
   const grid = window.ExifGrid.createGrid({
@@ -741,6 +793,8 @@
   async function refreshPanel() {
     const paths = selection.paths;
     if (!paths.length) {
+      // Nothing selected is a state a late read must not overwrite.
+      invalidateReads();
       panel.clear();
       refreshDraftUi();
       geotag.refresh();
@@ -753,6 +807,9 @@
 
     const missing = paths.filter((p) => !metadataCache.has(p));
     if (!missing.length) {
+      // Everything is cached, so this paints immediately — and supersedes any
+      // read still running for a previous selection.
+      invalidateReads();
       panel.show(paths.map((p) => metadataCache.get(p)), draftsForSelection());
       geotag.refresh();
       tools.refresh();
@@ -762,7 +819,7 @@
       return;
     }
 
-    const token = ++readToken;
+    const token = invalidateReads();
     panel.loading(paths.length);
     try {
       const results = await window.NativeAPI.readMetadata(missing);
@@ -780,13 +837,17 @@
       // which shifts every later index. Storing one photo's tags under another
       // photo's path is the failure that writes the wrong values to the wrong
       // files, so an entry that matches nothing is dropped rather than guessed.
+      // Checked *before* the cache is written, not after. A read that started
+      // in a folder since closed would otherwise repopulate a cache
+      // `loadFolder` had just cleared, leaving entries for photos that are no
+      // longer on screen and can never be evicted.
+      if (token !== readToken) return;
+
       const requestedBy = new Map(missing.map((p) => [S.normalisePath(p), p]));
       for (const entry of results || []) {
         const requested = entry && requestedBy.get(S.normalisePath(entry.SourceFile));
         if (requested) metadataCache.set(requested, entry);
       }
-      // The selection may have moved on while this read was in flight.
-      if (token !== readToken) return;
       const entries = paths.map((p) => metadataCache.get(p)).filter(Boolean);
       panel.show(entries, draftsForSelection());
       geotag.refresh();
@@ -810,6 +871,8 @@
     // Drafts are keyed by path and describe photos in the folder being left.
     // They survive filtering and refreshing, but not this.
     drafts.clear();
+    // Any read still running belongs to the folder being closed.
+    invalidateReads();
     // Immediately, rather than letting the next selection do it: an empty
     // folder never selects anything, and a folder that fails to open returns
     // early. Either would otherwise leave the shell still believing there is
@@ -881,7 +944,9 @@
         needsPreview: e.needs_preview,
       }));
       // Files may have changed on disk since the last read; a stale tag object
-      // would show the user metadata that is no longer there.
+      // would show the user metadata that is no longer there — including one
+      // still in flight, which is what `invalidateReads` takes care of.
+      invalidateReads();
       metadataCache.clear();
       invalidatePreviews();
       applyFilter();
